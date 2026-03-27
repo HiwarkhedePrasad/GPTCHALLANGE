@@ -638,7 +638,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         
         // Edge colors - NO blue/violet (GitNexus-style)
         const EDGE_COLORS = {
-            contains: '#2d5a3d',
+            contains: '#1db954',  // was #2d5a3d - bright green visible on dark bg
             defines: '#059669',
             imports: '#14b8a6',
             calls: '#f97316',
@@ -705,9 +705,9 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 }
             });
             
-            // Spread factor based on graph size
-            const spread = Math.sqrt(nodeCount) * 30;
-            const childJitter = Math.sqrt(nodeCount) * 5;
+            // Spread factor based on graph size - increased for better separation
+            const spread = Math.sqrt(nodeCount) * 80;
+            const childJitter = spread * 0.4;
             
             // Position map
             const positions = new Map();
@@ -719,6 +719,9 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             const structuralTypes = new Set(['folder', 'file']);
             const structuralNodes = data.nodes.filter(n => structuralTypes.has(n.type));
             const contentNodes = data.nodes.filter(n => !structuralTypes.has(n.type));
+            
+            // Count orphans for golden angle positioning
+            let orphanIndex = 0;
             
             // Position structural nodes first (radial pattern)
             structuralNodes.forEach((node, i) => {
@@ -758,9 +761,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                     x = parentPos.x + (Math.random() - 0.5) * childJitter;
                     y = parentPos.y + (Math.random() - 0.5) * childJitter;
                 } else {
-                    // Orphan node - position randomly
-                    x = (Math.random() - 0.5) * spread * 0.5;
-                    y = (Math.random() - 0.5) * spread * 0.5;
+                    // Orphan node - use golden angle spiral (not random center pile)
+                    const angle = orphanIndex * goldenAngle;
+                    const r = spread * 0.3 * Math.sqrt(orphanIndex + 1);
+                    x = r * Math.cos(angle);
+                    y = r * Math.sin(angle);
+                    orphanIndex++;
                 }
                 
                 positions.set(node.id, { x, y });
@@ -983,7 +989,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             const theta = 1.5; // Barnes-Hut approximation parameter
             const k = Math.sqrt(nodeCount * 200) / 2;
             const k2 = k * k;
-            const gravity = 0.1;
+            const gravity = 0.01; // was 0.1 - weaker gravity lets clusters separate
 
             for (let iter = 0; iter < iterations; iter++) {
                 const cooling = 1 - iter / iterations;
@@ -1081,9 +1087,9 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             document.getElementById('layout-toggle').classList.add('active');
             document.getElementById('layout-toggle').textContent = '⏸';
 
-            // Adaptive iterations based on graph size - keep UI responsive
+            // Adaptive iterations based on graph size - more iterations for better separation
             let iteration = 0;
-            const maxIterations = nodeCount < 100 ? 30 : nodeCount < 500 ? 20 : 15;
+            const maxIterations = nodeCount < 100 ? 120 : nodeCount < 500 ? 80 : 50; // was 30/20/15
             const itersPerFrame = nodeCount < 500 ? 3 : 1;
             const frameInterval = nodeCount < 500 ? 16 : 32; // ms
 

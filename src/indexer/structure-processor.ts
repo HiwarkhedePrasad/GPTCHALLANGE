@@ -1,7 +1,7 @@
 /**
  * Phase 1: Structure Processor
- * Creates file nodes with CONTAINS edges to symbols
- * Note: We skip creating folder nodes for performance - the webview handles visualization
+ * Creates file and folder nodes with CONTAINS edges
+ * Creates FULL folder chain (e.g., src/indexer not just src)
  */
 
 import * as path from 'path';
@@ -20,36 +20,9 @@ export class StructureProcessor {
     ): ProcessedStructure {
         const nodes: GraphNode[] = [];
         const edges: GraphEdge[] = [];
-
-        // Fast path: Pre-allocate arrays and use Maps for better performance
-        const filesByTopDir = new Map<string, Set<string>>();
-
-        // Single pass: group files and create file nodes immediately
-        for (const file of files) {
-            const relativePath = path.relative(rootPath, file);
-            const parts = relativePath.split(path.sep);
-
-            // Group by first directory level
-            const topDir = parts.length > 1 ? parts[0] : '';
-            if (!filesByTopDir.has(topDir)) {
-                filesByTopDir.set(topDir, new Set());
-            }
-            filesByTopDir.get(topDir)!.add(relativePath);
-
-            // Create file node immediately (avoiding second iteration)
-            const info = getFileInfo(file, rootPath);
-            nodes.push({
-                id: `file:${relativePath}`,
-                name: path.basename(relativePath),
-                type: 'file',
-                path: file,
-                metadata: {
-                    language: info.language,
-                    extension: info.extension,
-                    relativePath
-                }
-            });
-        }
+        
+        // Track created folder IDs to avoid duplicates
+        const createdFolders = new Set<string>();
 
         // Create root folder node
         const rootFolderId = 'folder:';
@@ -60,48 +33,63 @@ export class StructureProcessor {
             path: rootPath,
             metadata: { relativePath: '' }
         });
+        createdFolders.add(rootFolderId);
 
-        // Create top-level folder nodes and edges
-        for (const [topDir, dirFiles] of filesByTopDir.entries()) {
-            if (!topDir) {
-                // Handle files at root level
-                for (const relativePath of dirFiles) {
+        // Process each file - create full folder chain
+        for (const file of files) {
+            const relativePath = path.relative(rootPath, file).replace(/\\/g, '/');
+            const parts = relativePath.split('/').filter(Boolean);
+            
+            // Build full folder chain: src/indexer/graph
+            let parentId = rootFolderId;
+            let folderPath = '';
+            
+            for (let i = 0; i < parts.length - 1; i++) {
+                folderPath = folderPath ? folderPath + '/' + parts[i] : parts[i];
+                const folderId = `folder:${folderPath}`;
+                
+                // Create folder if not exists
+                if (!createdFolders.has(folderId)) {
+                    nodes.push({
+                        id: folderId,
+                        name: parts[i],
+                        type: 'folder',
+                        path: path.join(rootPath, folderPath),
+                        metadata: { relativePath: folderPath }
+                    });
                     edges.push({
-                        source: rootFolderId,
-                        target: `file:${relativePath}`,
+                        source: parentId,
+                        target: folderId,
                         type: 'contains',
                         weight: 1
                     });
+                    createdFolders.add(folderId);
                 }
-                continue;
+                parentId = folderId;
             }
-
-            const folderId = `folder:${topDir}`;
+            
+            // Create file node
+            const fileId = `file:${relativePath}`;
+            const info = getFileInfo(file, rootPath);
             nodes.push({
-                id: folderId,
-                name: topDir,
-                type: 'folder',
-                path: path.join(rootPath, topDir),
-                metadata: { relativePath: topDir }
+                id: fileId,
+                name: path.basename(relativePath),
+                type: 'file',
+                path: file,
+                metadata: {
+                    language: info.language,
+                    extension: info.extension,
+                    relativePath
+                }
             });
-
-            // Root contains this folder
+            
+            // Connect file to its parent folder
             edges.push({
-                source: rootFolderId,
-                target: folderId,
+                source: parentId,
+                target: fileId,
                 type: 'contains',
                 weight: 1
             });
-
-            // Folder contains files
-            for (const relativePath of dirFiles) {
-                edges.push({
-                    source: folderId,
-                    target: `file:${relativePath}`,
-                    type: 'contains',
-                    weight: 1
-                });
-            }
         }
 
         return { nodes, edges };
