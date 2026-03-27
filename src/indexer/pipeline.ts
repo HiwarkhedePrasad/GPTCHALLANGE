@@ -12,7 +12,7 @@
  */
 
 import * as vscode from 'vscode';
-import { GraphNode, GraphEdge, KnowledgeGraph } from './IndexerService';
+import { GraphNode, GraphEdge, KnowledgeGraph, NodeType } from './IndexerService';
 
 import { FileCache } from './FileCache';
 
@@ -38,6 +38,35 @@ export interface PipelineConfig {
     supportedLanguages?: string[];
 }
 
+/**
+ * Deduplication layer for graph construction (GitNexus-style)
+ */
+class GraphBuilder {
+    private readonly nodeMap = new Map<string, GraphNode>();
+    private readonly edgeMap = new Map<string, GraphEdge>();
+
+    addNode(node: GraphNode): boolean {
+        if (this.nodeMap.has(node.id)) return false;
+        this.nodeMap.set(node.id, node);
+        return true;
+    }
+
+    addEdge(edge: GraphEdge): boolean {
+        const key = `${edge.source}-${edge.type}-${edge.target}`;
+        if (this.edgeMap.has(key)) return false;
+        this.edgeMap.set(key, edge);
+        return true;
+    }
+
+    get nodes(): GraphNode[] {
+        return Array.from(this.nodeMap.values());
+    }
+
+    get edges(): GraphEdge[] {
+        return Array.from(this.edgeMap.values());
+    }
+}
+
 export class Pipeline {
     private readonly fsWalker          = new FilesystemWalker();
     private readonly structureProc     = new StructureProcessor();
@@ -55,16 +84,20 @@ export class Pipeline {
         rootPath: string,
         config: PipelineConfig
     ): Promise<KnowledgeGraph> {
+        const graph = new GraphBuilder();
         const walkResult = await this.fsWalker.walk(rootPath, config.excludePatterns);
-        const structure  = this.structureProc.process(
+        const structure = this.structureProc.process(
             walkResult.files,
             rootPath,
             (p, r) => this.fsWalker.getFileInfo(p, r)
         );
 
+        for (const node of structure.nodes) graph.addNode(node);
+        for (const edge of structure.edges) graph.addEdge(edge);
+
         return {
-            nodes:    structure.nodes,
-            edges:    structure.edges,
+            nodes:    graph.nodes,
+            edges:    graph.edges,
             clusters: [],
             metadata: {
                 indexedAt:   new Date().toISOString(),
@@ -83,8 +116,7 @@ export class Pipeline {
         token: vscode.CancellationToken,
         config: PipelineConfig
     ): Promise<KnowledgeGraph> {
-        const nodes: GraphNode[]  = [];
-        const edges: GraphEdge[]  = [];
+        const graph = new GraphBuilder();
         let fileCount    = 0;
         let symbolCount  = 0;
         let languages: Set<string> = new Set();
@@ -129,8 +161,8 @@ export class Pipeline {
             rootPath,
             (p, r) => this.fsWalker.getFileInfo(p, r)
         );
-        nodes.push(...structure.nodes);
-        edges.push(...structure.edges);
+        for (const node of structure.nodes) graph.addNode(node);
+        for (const edge of structure.edges) graph.addEdge(edge);
 
         report(1, 'Structure', `Found ${fileCount} files`, 15);
         cancelled();
@@ -146,18 +178,39 @@ export class Pipeline {
             (msg, cur, tot) => report(2, 'Parsing', msg)
         );
 
-        // Build relative-path→symbols lookup and add symbol nodes + CONTAINS edges
+        // Build relative-path→symbols lookup and add symbol nodes + DEFINES edges
+        console.log('[Pipeline] Processing', symbolsByFile.size, 'files with symbols');
+        
+        // First pass: collect all class IDs for linking
+        const classIdsByFile = new Map<string, Map<string, string>>();
+        
+        for (const [absPath, symbols] of symbolsByFile.entries()) {
+            const entry = cache.get(absPath);
+            if (!entry) continue;
+            const relPath = entry.relativePath.replace(/\\/g, '/');
+            const classIds = new Map<string, string>();
+            
+            for (const sym of symbols) {
+                if (sym.type === 'class') {
+                    classIds.set(sym.name, `symbol:${relPath}:${sym.name}`);
+                }
+            }
+            classIdsByFile.set(absPath, classIds);
+        }
+        
+        // Second pass: add all symbols with proper edges
         for (const [absPath, symbols] of symbolsByFile.entries()) {
             const entry = cache.get(absPath);
             if (!entry) continue;
 
             const relPath = entry.relativePath.replace(/\\/g, '/');
+            const classIds = classIdsByFile.get(absPath);
 
             for (const sym of symbols) {
                 symbolCount++;
                 const symId = `symbol:${relPath}:${sym.name}`;
 
-                nodes.push({
+                const added = graph.addNode({
                     id:       symId,
                     name:     sym.name,
                     type:     this.mapSymbolType(sym.type),
@@ -166,14 +219,29 @@ export class Pipeline {
                     metadata: sym.metadata,
                 });
 
-                edges.push({
+                // File → Symbol (DEFINES)
+                graph.addEdge({
                     source: `file:${relPath}`,
                     target: symId,
-                    type:   'contains',
+                    type:   'defines',
                     weight: 1,
                 });
+
+                // Class → Method/Property/Constructor (HAS_METHOD)
+                if (sym.parentClass && classIds) {
+                    const classId = classIds.get(sym.parentClass);
+                    if (classId) {
+                        graph.addEdge({
+                            source: classId,
+                            target: symId,
+                            type:   'has_method',
+                            weight: 1,
+                        });
+                    }
+                }
             }
         }
+        console.log('[Pipeline] Added', symbolCount, 'symbol nodes');
 
         report(2, 'Parsing', `Found ${symbolCount} symbols`, 15);
         cancelled();
@@ -189,7 +257,7 @@ export class Pipeline {
             rootPath,
             (msg) => report(3, 'Resolution', msg)
         );
-        edges.push(...importEdges);
+        for (const edge of importEdges) graph.addEdge(edge);
 
         report(3, 'Resolution', 'Resolving call graph...');
 
@@ -199,7 +267,7 @@ export class Pipeline {
             rootPath,
             (msg) => report(3, 'Resolution', msg)
         );
-        edges.push(...callEdges);
+        for (const edge of callEdges) graph.addEdge(edge);
 
         report(3, 'Resolution', `${importEdges.length} imports, ${callEdges.length} calls`, 15);
         cancelled();
@@ -211,12 +279,12 @@ export class Pipeline {
         cancelled();
 
         const communityResult = this.communityProc.process(
-            nodes,
-            edges,
+            graph.nodes,
+            graph.edges,
             (msg, progress) => report(4, 'Clustering', msg)
         );
 
-        for (const node of nodes) {
+        for (const node of graph.nodes) {
             node.cluster = communityResult.nodeClusterMap.get(node.id);
         }
 
@@ -227,8 +295,8 @@ export class Pipeline {
                 color: getCommunityColor(parseInt(c.id.split('_')[1]) || 0),
                 nodeCount: c.symbolCount
             })),
-            nodes,
-            edges,
+            graph.nodes,
+            graph.edges,
             communityResult.nodeClusterMap
         );
 
@@ -241,15 +309,15 @@ export class Pipeline {
         report(5, 'Execution', 'Tracing execution flows...');
         cancelled();
 
-        this.processProc.process(nodes, edges);
+        this.processProc.process(graph.nodes, graph.edges);
 
         // Calculate connection counts
         const connCounts = new Map<string, number>();
-        for (const edge of edges) {
+        for (const edge of graph.edges) {
             connCounts.set(edge.source, (connCounts.get(edge.source) ?? 0) + 1);
             connCounts.set(edge.target, (connCounts.get(edge.target) ?? 0) + 1);
         }
-        for (const node of nodes) {
+        for (const node of graph.nodes) {
             node.connections = connCounts.get(node.id) ?? 0;
         }
 
@@ -257,8 +325,8 @@ export class Pipeline {
 
         // cache goes out of scope here → GC reclaims the RAM
         return {
-            nodes,
-            edges,
+            nodes: graph.nodes,
+            edges: graph.edges,
             clusters: enrichedClusters.map(c => ({
                 id:        c.id,
                 name:      c.name,
@@ -276,15 +344,14 @@ export class Pipeline {
 
     // ─── helpers ─────────────────────────────────────────────────────────────
 
-    private mapSymbolType(type: string): GraphNode['type'] {
-        const map: Record<string, GraphNode['type']> = {
-            function:  'function',
-            class:     'class',
-            interface: 'interface',
-            method:    'method',
-            variable:  'variable',
-            type:      'interface',
-        };
-        return map[type] ?? 'variable';
+    private mapSymbolType(type: string): NodeType {
+        const knownTypes: NodeType[] = [
+            'function', 'class', 'interface', 'method', 'variable', 'struct',
+            'enum', 'trait', 'impl', 'namespace', 'module', 'constructor',
+            'property', 'const', 'static', 'record', 'typedef', 'union', 'macro'
+        ];
+        if (type === 'type') return 'interface';
+        if (knownTypes.includes(type as NodeType)) return type as NodeType;
+        return 'variable';
     }
 }

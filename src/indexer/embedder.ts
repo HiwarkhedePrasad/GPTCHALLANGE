@@ -181,7 +181,7 @@ function textToVector(text: string): Float32Array {
         let hash = 0;
         for (let j = 0; j < term.length; j++) {
             hash = ((hash << 5) - hash) + term.charCodeAt(j);
-            hash = hash & hash; // Convert to 32-bit integer
+            hash = hash | 0; // Convert to 32-bit integer
         }
 
         const position = Math.abs(hash) % dimensions;

@@ -379,13 +379,14 @@ export class OmniCodeAgent {
             },
             {
                 name: 'patch_file',
-                description: 'Replace a specific section of a file',
+                description: 'Replace a specific section of a file. Use replaceAll=true to replace all occurrences, or provide unique surrounding context to target a specific one.',
                 parameters: {
                     type: 'object',
                     properties: {
                         path: { type: 'string', description: 'Path to the file' },
-                        search: { type: 'string', description: 'Text to find in the file' },
+                        search: { type: 'string', description: 'Text to find in the file (include surrounding context for uniqueness)' },
                         replace: { type: 'string', description: 'Text to replace it with' },
+                        replaceAll: { type: 'boolean', description: 'If true, replaces all occurrences. Default is false (only first occurrence).' },
                     },
                     required: ['path', 'search', 'replace'],
                 },
@@ -400,13 +401,36 @@ export class OmniCodeAgent {
                             return JSON.stringify({ error: 'User denied file patch operation' });
                         }
                     }
-                    const content = await this.fileSystem.readFile(params.path as string);
-                    const newContent = content.replace(params.search as string, params.replace as string);
-                    if (newContent === content) {
+                    const fileInfo = await this.fileSystem.readFile(params.path as string);
+                    const content = fileInfo.content;
+                    const searchStr = params.search as string;
+                    const replaceStr = params.replace as string;
+                    const replaceAll = params.replaceAll === true;
+                    
+                    // Count occurrences
+                    let count = 0;
+                    let pos = 0;
+                    while ((pos = content.indexOf(searchStr, pos)) !== -1) {
+                        count++;
+                        pos += searchStr.length;
+                    }
+                    
+                    if (count === 0) {
                         return JSON.stringify({ error: 'Search text not found in file' });
                     }
+                    
+                    if (count > 1 && !replaceAll) {
+                        return JSON.stringify({ 
+                            error: `Found ${count} occurrences. Use replaceAll=true to replace all, or provide more specific surrounding context to target one.` 
+                        });
+                    }
+                    
+                    const newContent = replaceAll 
+                        ? content.split(searchStr).join(replaceStr)
+                        : content.replace(searchStr, replaceStr);
+                        
                     await this.fileSystem.writeFile(params.path as string, newContent);
-                    return JSON.stringify({ success: true, path: params.path });
+                    return JSON.stringify({ success: true, path: params.path, replaced: replaceAll ? count : 1 });
                 },
             },
             {
@@ -485,7 +509,7 @@ export class OmniCodeAgent {
                     }
                     const output = await this.terminal.runCommand(
                         params.command as string,
-                        params.cwd as string | undefined
+                        { cwd: params.cwd as string | undefined }
                     );
                     return JSON.stringify({ output });
                 },

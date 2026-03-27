@@ -9,10 +9,20 @@ import { PipelineProgress } from './pipeline';
 import { runEmbeddingPipeline, semanticSearch as embeddingSearch, clearEmbeddings } from './embedding-pipeline';
 import { EmbeddingProgress } from './embedding-types';
 
+export const NODE_TYPES = [
+    'file', 'folder', 'function', 'class', 'interface', 'method',
+    'variable', 'struct', 'enum', 'trait', 'impl', 'macro',
+    'typedef', 'union', 'namespace', 'typealias', 'const', 'static',
+    'property', 'record', 'constructor', 'module', 'package',
+    'community', 'process'
+] as const;
+
+export type NodeType = typeof NODE_TYPES[number];
+
 export interface GraphNode {
     id: string;
     name: string;
-    type: 'file' | 'folder' | 'class' | 'function' | 'interface' | 'variable' | 'method';
+    type: NodeType;
     path?: string;
     cluster?: number;
     connections?: number;
@@ -20,11 +30,19 @@ export interface GraphNode {
     metadata?: Record<string, unknown>;
 }
 
+export const EDGE_TYPES = [
+    'contains', 'defines', 'calls', 'imports', 'implements',
+    'extends', 'has_method', 'member_of', 'participates_in'
+] as const;
+
+export type EdgeType = typeof EDGE_TYPES[number];
+
 export interface GraphEdge {
     source: string;
     target: string;
-    type: 'imports' | 'calls' | 'extends' | 'implements' | 'contains' | 'exports';
+    type: EdgeType;
     weight?: number;
+    confidence?: number;
 }
 
 export interface KnowledgeGraph {

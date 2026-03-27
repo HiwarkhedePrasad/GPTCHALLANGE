@@ -14,9 +14,10 @@ import { TreeSitterParser } from './tree-sitter-parser';
 
 export interface ParsedSymbol {
     name: string;
-    type: 'function' | 'class' | 'interface' | 'method' | 'variable' | 'type';
+    type: 'function' | 'class' | 'interface' | 'method' | 'variable' | 'type' | 'property' | 'constructor';
     location: { line: number; column: number };
     metadata: Record<string, unknown>;
+    parentClass?: string;
 }
 
 export class ParsingProcessor {
@@ -60,22 +61,27 @@ export class ParsingProcessor {
                     (msg, cur, tot) => onProgress?.(msg, cur, tot)
                 );
 
-                // Convert tree-sitter symbols to ParsedSymbol format
-                for (const [absPath, symbols] of tsResults.entries()) {
-                    symbolsByFile.set(absPath, symbols.map(s => ({
-                        name: s.name,
-                        type: s.type,
-                        location: s.location,
-                        metadata: s.metadata
-                    })));
+                // If tree-sitter found symbols, use them
+                if (tsResults.size > 0) {
+                    // Convert tree-sitter symbols to ParsedSymbol format
+                    for (const [absPath, symbols] of tsResults.entries()) {
+                        symbolsByFile.set(absPath, symbols.map(s => ({
+                            name: s.name,
+                            type: s.type,
+                            location: s.location,
+                            metadata: s.metadata
+                        })));
+                    }
+                    return symbolsByFile;
                 }
-                return symbolsByFile;
+                // If no symbols found, fall through to regex (parsers may not be installed)
             } catch (error) {
                 console.warn('[Parsing] Tree-sitter failed, falling back to regex:', error);
             }
         }
 
         // Fallback to regex parsing
+        console.log('[Parsing] Using regex parsing for', entries.length, 'files');
         for (let i = 0; i < entries.length; i += BATCH) {
             const batch = entries.slice(i, i + BATCH);
 
@@ -94,6 +100,7 @@ export class ParsingProcessor {
             await new Promise<void>(resolve => setImmediate(resolve));
         }
 
+        console.log('[Parsing] Found symbols in', symbolsByFile.size, 'files');
         return symbolsByFile;
     }
 
@@ -124,23 +131,68 @@ export class ParsingProcessor {
 
     private extractJSSymbols(lines: string[]): ParsedSymbol[] {
         const symbols: ParsedSymbol[] = [];
+        
+        // Track class context (class name → line number where it ends)
+        const classContexts: Array<{ name: string; endLine: number }> = [];
+        
         const patterns = [
             { regex: /(?:export\s+)?(?:async\s+)?function\s+(\w+)/g,               type: 'function'  as const },
-            { regex: /(?:export\s+)?class\s+(\w+)/g,                               type: 'class'     as const },
+            { regex: /(?:export\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?/g,     type: 'class'     as const, captureClass: true },
             { regex: /(?:export\s+)?interface\s+(\w+)/g,                           type: 'interface' as const },
             { regex: /(?:export\s+)?type\s+(\w+)/g,                                type: 'type'      as const },
             { regex: /(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=/g,               type: 'variable'  as const },
-            { regex: /(\w+)\s*\([^)]*\)\s*(?::\s*\w+)?\s*\{/g,                    type: 'method'    as const },
+            { regex: /constructor\s*\(/g,                                          type: 'constructor' as const },
+            { regex: /(?:async\s+)?(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^{]+)?\s*\{/g, type: 'method' as const },
+            { regex: /(?:get|set)\s+(\w+)\s*\(/g,                                  type: 'property' as const },
         ];
 
+        const falsePositives = ['if (', 'while (', 'for (', 'switch (', 'catch (', 'with ('];
+
         for (let lineNum = 0; lineNum < lines.length; lineNum++) {
-            const line = lines[lineNum];
+            const line = lines[lineNum].trim();
+            const indent = lines[lineNum].search(/\S/);
+            
+            // Check if we've exited a class scope
+            while (classContexts.length > 0 && lineNum >= classContexts[classContexts.length - 1].endLine) {
+                classContexts.pop();
+            }
+            
+            // Detect class definition and its end
+            const classMatch = line.match(/(?:export\s+)?class\s+(\w+)/);
+            if (classMatch) {
+                // Find where class ends (next class or EOF at same/lower indent)
+                let endLine = lines.length;
+                for (let i = lineNum + 1; i < lines.length; i++) {
+                    const nextLine = lines[i].trim();
+                    const nextIndent = lines[i].search(/\S/);
+                    if (nextLine && nextIndent <= indent && (nextLine.startsWith('class ') || nextLine.startsWith('export ') || nextLine.startsWith('function '))) {
+                        endLine = i;
+                        break;
+                    }
+                }
+                classContexts.push({ name: classMatch[1], endLine });
+            }
+            
+            // Get current class context
+            const currentClass = classContexts.length > 0 ? classContexts[classContexts.length - 1].name : undefined;
+            
+            if (line.startsWith('//') || line.startsWith('*') || line.startsWith('/*') || !line) continue;
+
             for (const { regex, type } of patterns) {
                 regex.lastIndex = 0;
-                let match;
+                let match: RegExpExecArray | null;
                 while ((match = regex.exec(line)) !== null) {
-                    if (this.isLikelyDeclaration(match[0])) {
-                        symbols.push({ name: match[1], type, location: { line: lineNum, column: match.index }, metadata: {} });
+                    if (!falsePositives.some(fp => match![0].includes(fp))) {
+                        const symbol: ParsedSymbol = { 
+                            name: match[1], 
+                            type, 
+                            location: { line: lineNum, column: match.index }, 
+                            metadata: {} 
+                        };
+                        if (currentClass && (type === 'method' || type === 'property' || type === 'constructor')) {
+                            symbol.parentClass = currentClass;
+                        }
+                        symbols.push(symbol);
                     }
                 }
             }

@@ -78,9 +78,15 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     updateGraph(graph: KnowledgeGraph): void {
         this.currentGraph = graph;
         
+        const nodeTypes = graph.nodes.reduce((acc, n) => {
+            acc[n.type] = (acc[n.type] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>);
+        
         console.log('Updating graph:', {
             nodeCount: graph.nodes.length,
             edgeCount: graph.edges.length,
+            nodeTypes,
             hasView: !!this.view
         });
         
@@ -170,10 +176,10 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh 'unsafe-inline' 'unsafe-eval'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data: blob:; connect-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh;">
     <title>OmniCode</title>
-    <!-- Sigma.js + Graphology -->
+    <!-- Sigma.js v3 + Graphology -->
     <script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
     <script type="module">
-        import Sigma from 'https://esm.sh/sigma@1.2.1';
+        import Sigma from 'https://esm.sh/sigma@3.0.0';
         window.Sigma = Sigma;
     </script>
     <style>
@@ -569,15 +575,31 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         
         // === CONFIG - Warm colors only (NO blue/violet) ===
         const NODE_COLORS = {
-            folder: '#10b981',   // Emerald
-            file: '#22d3ee',     // Cyan
-            class: '#f97316',    // Orange
-            function: '#ef4444', // Red
-            method: '#ec4899',   // Pink
-            interface: '#14b8a6', // Teal
-            variable: '#64748b',  // Slate
-            import: '#475569',    // Dark slate
-            type: '#f59e0b'       // Amber
+            folder: '#10b981',      // Emerald
+            file: '#22d3ee',        // Cyan
+            class: '#f97316',       // Orange
+            function: '#ef4444',    // Red
+            method: '#ec4899',      // Pink
+            interface: '#14b8a6',   // Teal
+            variable: '#64748b',    // Slate
+            import: '#475569',      // Dark slate
+            type: '#f59e0b',        // Amber
+            struct: '#f97316',      // Orange (like class)
+            enum: '#eab308',        // Yellow
+            trait: '#a78bfa',       // Violet
+            impl: '#c084fc',        // Purple
+            namespace: '#22c55e',   // Green
+            module: '#10b981',      // Emerald
+            constructor: '#f43f5e', // Rose
+            property: '#64748b',    // Slate
+            const: '#eab308',       // Yellow
+            static: '#94a3b8',      // Light slate
+            record: '#f59e0b',      // Amber
+            typedef: '#d946ef',     // Fuchsia
+            union: '#14b8a6',       // Teal
+            macro: '#f43f5e',       // Rose
+            community: '#8b5cf6',   // Purple
+            process: '#06b6d4'      // Cyan
         };
         
         const NODE_SIZES = {
@@ -589,7 +611,23 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             interface: 9,
             variable: 4,
             import: 3,
-            type: 5
+            type: 5,
+            struct: 10,
+            enum: 7,
+            trait: 8,
+            impl: 7,
+            namespace: 11,
+            module: 10,
+            constructor: 5,
+            property: 4,
+            const: 4,
+            static: 4,
+            record: 6,
+            typedef: 5,
+            union: 6,
+            macro: 5,
+            community: 10,
+            process: 8
         };
         
         // Warm community colors - NO blue/violet
@@ -598,14 +636,20 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             '#10b981', '#f59e0b', '#d946ef', '#ec4899', '#f43f5e'
         ];
         
-        // Edge colors - NO blue/violet
+        // Edge colors - NO blue/violet (GitNexus-style)
         const EDGE_COLORS = {
             contains: '#2d5a3d',
             defines: '#059669',
-            import: '#14b8a6',
-            call: '#f97316',
+            imports: '#14b8a6',
+            calls: '#f97316',
             extends: '#c2410c',
-            implements: '#be185d'
+            implements: '#be185d',
+            has_method: '#ec4899',
+            member_of: '#f59e0b',
+            participates_in: '#8b5cf6',
+            // Legacy aliases
+            import: '#14b8a6',
+            call: '#f97316'
         };
         
         // === STATE ===
@@ -641,17 +685,23 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             const g = new graphology.Graph();
             const nodeCount = data.nodes.length;
             
-            // Build parent-child relationships
+            // Build parent-child relationships (GitNexus-style: contains, defines, has_method)
+            // Priority: has_method > defines > contains (methods should cluster with their class)
             const parentToChildren = new Map();
             const childToParent = new Map();
             
             data.edges.forEach(edge => {
-                if (['contains', 'defines'].includes(edge.type)) {
-                    if (!parentToChildren.has(edge.source)) {
-                        parentToChildren.set(edge.source, []);
+                if (['contains', 'defines', 'has_method'].includes(edge.type)) {
+                    // Prefer has_method edges for positioning (methods near class)
+                    const existingParent = childToParent.get(edge.target);
+                    if (!existingParent || edge.type === 'has_method') {
+                        childToParent.set(edge.target, edge.source);
+                        
+                        if (!parentToChildren.has(edge.source)) {
+                            parentToChildren.set(edge.source, []);
+                        }
+                        parentToChildren.get(edge.source).push(edge.target);
                     }
-                    parentToChildren.get(edge.source).push(edge.target);
-                    childToParent.set(edge.target, edge.source);
                 }
             });
             
@@ -741,13 +791,9 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
                     if (!g.hasEdge(edge.source, edge.target)) {
                         const color = EDGE_COLORS[edge.type] || '#3a3a4a';
-                        // Random curvature between -0.3 and 0.3 (negative = curve one way, positive = other)
-                        const curvature = (Math.random() - 0.5) * 0.6;
                         g.addEdge(edge.source, edge.target, {
                             size: edgeSize,
                             color,
-                            type: 'curved',
-                            curvature: curvature,
                             edgeType: edge.type
                         });
                     }
@@ -819,7 +865,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             container.style.height = '100%';
 
             try {
-                // Create Sigma instance
+                // Create Sigma instance (v3 compatible)
                 sigma = new Sigma(graph, container, {
                 renderLabels: true,
                 labelFont: 'JetBrains Mono, monospace',
@@ -831,7 +877,6 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
 
                 defaultNodeColor: '#6b7280',
                 defaultEdgeColor: '#2a2a3a',
-                defaultEdgeType: 'curved',  // Curved edges with varying curvature
 
                 minCameraRatio: 0.01,
                 maxCameraRatio: 100,
@@ -856,11 +901,6 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 
                 edgeReducer: (edge, data) => {
                     const res = { ...data };
-
-                    // Preserve curved edges - don't override to line
-                    if (!res.type) {
-                        res.type = 'curved';
-                    }
 
                     // Dim edges not connected to selected node
                     if (selectedNode) {
@@ -1034,37 +1074,59 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             stopLayout();
 
             const nodeCount = graph.order;
+            if (nodeCount === 0) return;
 
             isLayoutRunning = true;
             layoutIndicator.classList.add('visible');
             document.getElementById('layout-toggle').classList.add('active');
             document.getElementById('layout-toggle').textContent = '⏸';
 
-            // Use simple custom force layout - reduced for performance
+            // Adaptive iterations based on graph size - keep UI responsive
             let iteration = 0;
-            const maxIterations = Math.min(50, nodeCount * 0.5);
+            const maxIterations = nodeCount < 100 ? 30 : nodeCount < 500 ? 20 : 15;
+            const itersPerFrame = nodeCount < 500 ? 3 : 1;
+            const frameInterval = nodeCount < 500 ? 16 : 32; // ms
+
+            let lastFrameTime = 0;
+            
+            function layoutFrame() {
+                if (!isLayoutRunning || !graph) {
+                    stopLayout();
+                    return;
+                }
+
+                const now = performance.now();
+                if (now - lastFrameTime < frameInterval) {
+                    layoutWorker.rafId = requestAnimationFrame(layoutFrame);
+                    return;
+                }
+                lastFrameTime = now;
+
+                simpleForceLayout(itersPerFrame);
+                if (sigma) sigma.refresh();
+
+                iteration += itersPerFrame;
+                if (iteration >= maxIterations) {
+                    stopLayout();
+                    return;
+                }
+
+                layoutWorker.rafId = requestAnimationFrame(layoutFrame);
+            }
 
             layoutWorker = {
-                interval: setInterval(() => {
-                    if (!isLayoutRunning || !graph) {
-                        stopLayout();
-                        return;
-                    }
-
-                    simpleForceLayout(5); // Run 5 iterations per frame
-                    if (sigma) sigma.refresh();
-
-                    iteration += 5;
-                    if (iteration >= maxIterations) {
-                        stopLayout();
-                    }
-                }, 16) // ~60fps
+                rafId: requestAnimationFrame(layoutFrame)
             };
         }
         
         function stopLayout() {
-            if (layoutWorker && layoutWorker.interval) {
-                clearInterval(layoutWorker.interval);
+            if (layoutWorker) {
+                if (layoutWorker.rafId) {
+                    cancelAnimationFrame(layoutWorker.rafId);
+                }
+                if (layoutWorker.interval) {
+                    clearInterval(layoutWorker.interval);
+                }
                 layoutWorker = null;
             }
 

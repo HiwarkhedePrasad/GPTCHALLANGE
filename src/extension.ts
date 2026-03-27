@@ -14,13 +14,14 @@ import { ProviderType, DEFAULT_MODELS } from './LLMProvider';
 let indexerService: IndexerService | undefined;
 let graphViewProvider: GraphViewProvider | undefined;
 let agent: OmniCodeAgent | undefined;
+let terminalProvider: TerminalProvider | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     console.log('OmniCode extension activating...');
 
     // Initialize providers
     const fileSystemProvider = new FileSystemProvider();
-    const terminalProvider = new TerminalProvider();
+    terminalProvider = new TerminalProvider();
 
     // Initialize the indexer service
     indexerService = new IndexerService(context);
@@ -137,7 +138,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
             // Initialize agent if needed
             if (!agent) {
-                agent = createAgent(config, apiKey, context, indexerService!, fileSystemProvider, terminalProvider);
+                agent = createAgent(config, apiKey, context, indexerService!, fileSystemProvider, terminalProvider!);
             }
 
             // Run agent with progress
@@ -259,5 +260,13 @@ function createAgent(
 }
 
 export function deactivate() {
+    // Clean up terminal processes to prevent zombie processes
+    if (terminalProvider) {
+        terminalProvider.dispose();
+        terminalProvider = undefined;
+    }
+    agent = undefined;
+    indexerService = undefined;
+    graphViewProvider = undefined;
     console.log('OmniCode extension deactivated');
 }

@@ -107,20 +107,27 @@ export class CommunityProcessor {
             // Louvain algorithm for community detection
             // resolution: higher = more communities (1.0 is standard)
             // weighted: whether to use edge weights
-            const communityMap = louvain(graph, {
+            const louvainResult = louvain(graph, {
                 resolution: isLarge ? 2.0 : 1.0,
                 randomWalk: false,
             });
 
-            // Convert Map to object format expected by the rest of the code
+            // louvain() returns LouvainMapping which is an object, not a Map
             const communities: Record<string, number> = {};
-            let communityCount = 0;
-            communityMap.forEach((community: number, node: string) => {
-                communities[node] = community;
-                communityCount = Math.max(communityCount, community + 1);
-            });
+            const result = louvainResult as any;
+            if (result && typeof result.forEach === 'function') {
+                result.forEach((community: number, node: string) => {
+                    communities[node] = community;
+                });
+            } else if (result) {
+                Object.assign(communities, result);
+            }
+            const communityCount = Object.keys(communities).length > 0
+                ? Math.max(...Object.values(communities)) + 1
+                : 0;
 
             // Calculate modularity (simplified)
+            const communityMap = new Map(Object.entries(communities).map(([k, v]) => [k, v as number]));
             const modularity = calculateModularity(graph, communityMap);
 
             details = {

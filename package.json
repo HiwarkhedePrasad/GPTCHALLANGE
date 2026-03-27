@@ -138,6 +138,6 @@
     "graphology-communities-louvain": "^2.0.2",
     "graphology-layout-forceatlas2": "^0.10.1",
     "graphology-layout-noverlap": "^0.4.1",
-    "sigma": "^1.2.1"
+    "sigma": "^3.0.0"
   }
 }

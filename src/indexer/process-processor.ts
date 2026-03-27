@@ -92,12 +92,14 @@ export class ProcessProcessor {
         const queue: Array<{ id: string; depth: number; parentId: string | null }> = [
             { id: entryPointId, depth: 0, parentId: null }
         ];
+        let maxDepth = 0;
 
         while (queue.length > 0) {
             const { id, depth, parentId } = queue.shift()!;
 
             if (visited.has(id) || depth >= this.maxDepth) continue;
             visited.add(id);
+            maxDepth = Math.max(maxDepth, depth);
 
             if (parentId !== null) {
                 nodes.push(id);
@@ -122,7 +124,7 @@ export class ProcessProcessor {
             }
         }
 
-        return { nodes, edges: traceEdges, depth };
+        return { nodes, edges: traceEdges, depth: maxDepth };
     }
 
     private findExitPoints(nodes: GraphNode[], edges: GraphEdge[]): string[] {
