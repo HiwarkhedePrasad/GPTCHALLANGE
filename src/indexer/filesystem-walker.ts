@@ -127,6 +127,9 @@ export class FilesystemWalker {
         // Add all files from this directory
         files.push(...foundFiles);
 
+        // CRITICAL: Yield to event loop to prevent freezing VS Code
+        await new Promise(resolve => setImmediate(resolve));
+
         // Process subdirectories in parallel (limited concurrency)
         const PARALLEL_DIRS = 10; // Process up to 10 directories at a time
         for (let i = 0; i < dirs.length; i += PARALLEL_DIRS) {
@@ -134,6 +137,9 @@ export class FilesystemWalker {
             await Promise.all(
                 batch.map(subdir => this.walkDirectory(subdir, rootPath, files))
             );
+            
+            // Yield after each batch of directories
+            await new Promise(resolve => setImmediate(resolve));
         }
     }
 

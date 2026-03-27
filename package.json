@@ -133,6 +133,11 @@
   },
   "dependencies": {
     "fuse.js": "^7.0.0",
-    "ignore": "^5.3.0"
+    "ignore": "^5.3.0",
+    "graphology": "^0.25.4",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "graphology-layout-noverlap": "^0.4.1",
+    "sigma": "^3.0.0",
+    "@sigma/edge-curve": "^3.0.0"
   }
 }

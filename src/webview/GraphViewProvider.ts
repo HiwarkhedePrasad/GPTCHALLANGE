@@ -170,7 +170,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net 'unsafe-inline' 'unsafe-eval'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data: blob:; connect-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net;">
     <title>OmniCode</title>
-    <!-- Sigma.js + Graphology for beautiful force-directed graphs -->
+    <!-- Sigma.js v3 + Graphology for GitNexus-style beautiful graphs -->
     <script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/graphology-layout-forceatlas2@0.10.1/build/graphology-layout-forceatlas2.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/graphology-layout-noverlap@2.0.1/build/graphology-layout-noverlap.min.js"></script>
@@ -183,8 +183,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             --text-primary: #f5f5f7;
             --text-secondary: #a1a1aa;
             --text-muted: #71717a;
-            --accent: #7c3aed;
-            --accent-glow: rgba(124, 58, 237, 0.3);
+            --accent: #10b981;
+            --accent-glow: rgba(16, 185, 129, 0.3);
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -209,12 +209,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         }
         #sigma-container:active { cursor: grabbing; }
         
-        /* Radial gradient background like GitNexus */
+        /* Radial gradient background - emerald glow */
         #graph-container::before {
             content: '';
             position: absolute;
             inset: 0;
-            background: radial-gradient(circle at 50% 50%, rgba(124, 58, 237, 0.05) 0%, transparent 70%);
+            background: radial-gradient(circle at 50% 50%, rgba(16, 185, 129, 0.05) 0%, transparent 70%);
             pointer-events: none;
         }
         
@@ -258,7 +258,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             50% { box-shadow: 0 0 12px 4px var(--accent-glow); }
         }
         
-        /* Selection info bar */
+        /* Selection info bar - emerald theme */
         .selection-bar {
             position: absolute;
             top: 12px;
@@ -268,8 +268,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             align-items: center;
             gap: 8px;
             padding: 8px 16px;
-            background: rgba(124, 58, 237, 0.15);
-            border: 1px solid rgba(124, 58, 237, 0.3);
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.3);
             border-radius: 12px;
             backdrop-filter: blur(8px);
             z-index: 20;
@@ -473,7 +473,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             transition: all 0.15s;
         }
         #send-btn:hover { 
-            background: #8b5cf6;
+            background: #059669;
             transform: translateY(-1px);
         }
         
@@ -524,11 +524,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         <div id="stats"></div>
         <div class="legend">
             <div class="legend-title">Node Types</div>
-            <div class="legend-item"><span class="legend-color" style="background: #6366f1;"></span>Folder</div>
-            <div class="legend-item"><span class="legend-color" style="background: #3b82f6;"></span>File</div>
-            <div class="legend-item"><span class="legend-color" style="background: #f59e0b;"></span>Class</div>
-            <div class="legend-item"><span class="legend-color" style="background: #10b981;"></span>Function</div>
-            <div class="legend-item"><span class="legend-color" style="background: #ec4899;"></span>Interface</div>
+            <div class="legend-item"><span class="legend-color" style="background: #10b981;"></span>Folder</div>
+            <div class="legend-item"><span class="legend-color" style="background: #22d3ee;"></span>File</div>
+            <div class="legend-item"><span class="legend-color" style="background: #f97316;"></span>Class</div>
+            <div class="legend-item"><span class="legend-color" style="background: #ef4444;"></span>Function</div>
+            <div class="legend-item"><span class="legend-color" style="background: #14b8a6;"></span>Interface</div>
         </div>
         <div class="selection-bar">
             <span class="selection-dot"></span>
@@ -566,17 +566,17 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     <script>
         const vscode = acquireVsCodeApi();
         
-        // === CONFIG (GitNexus style) ===
+        // === CONFIG - Warm colors only (NO blue/violet) ===
         const NODE_COLORS = {
-            folder: '#6366f1',   // Indigo
-            file: '#3b82f6',     // Blue
-            class: '#f59e0b',    // Amber
-            function: '#10b981', // Emerald
-            method: '#14b8a6',   // Teal
-            interface: '#ec4899', // Pink
+            folder: '#10b981',   // Emerald
+            file: '#22d3ee',     // Cyan
+            class: '#f97316',    // Orange
+            function: '#ef4444', // Red
+            method: '#ec4899',   // Pink
+            interface: '#14b8a6', // Teal
             variable: '#64748b',  // Slate
             import: '#475569',    // Dark slate
-            type: '#a78bfa'       // Violet
+            type: '#f59e0b'       // Amber
         };
         
         const NODE_SIZES = {
@@ -591,16 +591,18 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             type: 5
         };
         
+        // Warm community colors - NO blue/violet
         const COMMUNITY_COLORS = [
-            '#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4',
-            '#3b82f6', '#8b5cf6', '#d946ef', '#ec4899', '#f43f5e'
+            '#ef4444', '#f97316', '#eab308', '#22c55e', '#14b8a6',
+            '#10b981', '#f59e0b', '#d946ef', '#ec4899', '#f43f5e'
         ];
         
+        // Edge colors - NO blue/violet
         const EDGE_COLORS = {
             contains: '#2d5a3d',
-            defines: '#0e7490',
-            import: '#1d4ed8',
-            call: '#7c3aed',
+            defines: '#059669',
+            import: '#14b8a6',
+            call: '#f97316',
             extends: '#c2410c',
             implements: '#be185d'
         };
@@ -797,8 +799,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             }
             
             console.log('Graph built successfully, node count:', graph.order);
-            
-            // Create Sigma instance
+
+            // Create Sigma instance with curved edges (GitNexus style)
             sigma = new Sigma(graph, container, {
                 renderLabels: true,
                 labelFont: 'JetBrains Mono, monospace',
@@ -807,10 +809,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 labelColor: { color: '#e4e4ed' },
                 labelRenderedSizeThreshold: 6,
                 labelDensity: 0.15,
-                
+
                 defaultNodeColor: '#6b7280',
                 defaultEdgeColor: '#2a2a3a',
-                
+                defaultEdgeType: 'curve',  // Curved edges (sigma v2.x)
+
                 minCameraRatio: 0.01,
                 maxCameraRatio: 50,
                 
@@ -834,6 +837,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 
                 edgeReducer: (edge, data) => {
                     const res = { ...data };
+                    
+                    // Ensure edges are curved (from graph-adapter.ts)
+                    if (!res.type || res.type === 'arrow') {
+                        res.type = 'curve';
+                    }
                     
                     // Dim edges not connected to selected node
                     if (selectedNode) {

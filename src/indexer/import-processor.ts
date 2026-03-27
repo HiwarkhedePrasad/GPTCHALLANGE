@@ -1,163 +1,127 @@
 /**
- * Phase 3: Import Processor
- * Resolves import statements and creates IMPORTS edges between files
+ * Phase 3a: Import Processor
+ * Resolves import statements and creates IMPORTS edges between files.
+ *
+ * CHANGE: Accepts FileCache instead of reading files from disk.
+ * Also: resolveImportPath no longer calls fs.existsSync for every candidate
+ * extension — it checks against the set of cached paths instead (pure RAM lookup).
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
 import { GraphEdge } from './IndexerService';
-
-export interface ImportEdge {
-    sourceFile: string;
-    targetFile: string | null;
-    importPath: string;
-    isResolved: boolean;
-}
+import { FileCache } from './FileCache';
 
 export class ImportProcessor {
-    private importPatterns: RegExp[] = [
-        // ES6 imports: import x from 'path'
-        /import\s+(?:(?:[\w*{}\s]+,?\s*)+)\s+from\s+['"]([^'"]+)['"]/g,
-        // ES6 side-effect import: import 'path'
+    private readonly importPatterns: RegExp[] = [
+        /import\s+(?:[\w*{}\s,]+)\s+from\s+['"]([^'"]+)['"]/g,
         /import\s+['"]([^'"]+)['"]/g,
-        // CommonJS require: require('path')
         /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-        // Python imports: from x import y
         /from\s+([\w.]+)\s+import/g,
-        // Python direct import: import x
-        /import\s+([\w.]+)/g,
+        /^import\s+([\w.]+)/gm,
     ];
 
+    /**
+     * @param cache       Pre-loaded file cache (no disk I/O here)
+     * @param rootPath    Workspace root
+     * @param onProgress  Optional progress callback
+     */
     async process(
-        files: string[],
+        cache: FileCache,
         rootPath: string,
         onProgress?: (message: string, current: number, total: number) => void
     ): Promise<GraphEdge[]> {
         const edges: GraphEdge[] = [];
 
-        // Process files in parallel batches
-        const BATCH_SIZE = 50;
-        let processedCount = 0;
+        // Build a Set of all relative paths so resolveImportPath can do RAM lookups
+        const cachedRelPaths = new Set<string>();
+        for (const [, entry] of cache.entries()) {
+            cachedRelPaths.add(entry.relativePath.replace(/\\/g, '/'));
+        }
 
-        for (let i = 0; i < files.length; i += BATCH_SIZE) {
-            const batch = files.slice(i, Math.min(i + BATCH_SIZE, files.length));
+        const entries = [...cache.entries()];
+        const total = entries.length;
+        const BATCH = 100;
+        let processed = 0;
 
-            const batchResults = await Promise.all(
-                batch.map(async (file) => {
-                    const relativePath = path.relative(rootPath, file);
-                    try {
-                        const content = await fs.promises.readFile(file, 'utf-8');
-                        return this.extractImports(content, relativePath);
-                    } catch {
-                        return [];
-                    }
-                })
-            );
+        for (let i = 0; i < entries.length; i += BATCH) {
+            const batch = entries.slice(i, i + BATCH);
 
-            // Collect edges from batch
-            for (const importEdges of batchResults) {
-                for (const imp of importEdges) {
+            for (const [, { content, relativePath }] of batch) {
+                const imports = this.extractImports(content, relativePath, cachedRelPaths);
+                for (const imp of imports) {
                     if (imp.targetFile) {
                         edges.push({
                             source: `file:${imp.sourceFile}`,
                             target: `file:${imp.targetFile}`,
                             type: 'imports',
-                            weight: 1
+                            weight: 1,
                         });
                     }
                 }
+                processed++;
             }
 
-            processedCount += batch.length;
-            onProgress?.(`Resolving imports ${processedCount}/${files.length}`, processedCount, files.length);
-            
-            // CRITICAL: Yield to event loop every batch
-            await new Promise(resolve => setImmediate(resolve));
+            onProgress?.(`Resolving imports ${processed}/${total}`, processed, total);
+            await new Promise<void>(resolve => setImmediate(resolve));
         }
 
         return edges;
     }
 
-    private extractImports(content: string, sourceRelativePath: string): ImportEdge[] {
-        const imports: ImportEdge[] = [];
+    // ─── private ─────────────────────────────────────────────────────────────
+
+    private extractImports(
+        content: string,
+        sourceRelativePath: string,
+        cachedRelPaths: Set<string>
+    ): Array<{ sourceFile: string; targetFile: string | null; importPath: string }> {
+        const imports: Array<{ sourceFile: string; targetFile: string | null; importPath: string }> = [];
 
         for (const pattern of this.importPatterns) {
             pattern.lastIndex = 0;
             let match;
-
             while ((match = pattern.exec(content)) !== null) {
                 const importPath = match[1];
-                const resolved = this.resolveImportPath(sourceRelativePath, importPath);
-
-                imports.push({
-                    sourceFile: sourceRelativePath,
-                    targetFile: resolved,
+                const resolved = this.resolveImportPath(
+                    sourceRelativePath.replace(/\\/g, '/'),
                     importPath,
-                    isResolved: resolved !== null
-                });
+                    cachedRelPaths
+                );
+                imports.push({ sourceFile: sourceRelativePath, targetFile: resolved, importPath });
             }
         }
 
         return imports;
     }
 
-    private resolveImportPath(sourceFile: string, importPath: string): string | null {
+    /**
+     * Resolve a relative import path to a cached relative path.
+     * Uses Set lookups (O(1) RAM) instead of fs.existsSync (O(1) but disk).
+     */
+    private resolveImportPath(
+        sourceRelPath: string,
+        importPath: string,
+        cachedRelPaths: Set<string>
+    ): string | null {
         // Skip node_modules and absolute paths
-        if (!importPath.startsWith('.') && !importPath.startsWith('/')) {
-            return null;
-        }
+        if (!importPath.startsWith('.') && !importPath.startsWith('/')) return null;
 
-        const sourceDir = path.dirname(sourceFile);
-        let resolved = path.resolve(sourceDir, importPath);
+        const sourceDir = path.posix.dirname(sourceRelPath);
+        const base = path.posix.resolve('/', sourceDir, importPath).substring(1); // strip leading /
 
-        // Try with various extensions
-        const extensions = ['.ts', '.tsx', '.js', '.jsx', '.py', ''];
+        // Candidate list: exact match first, then extensions, then /index.*
+        const candidates = [
+            base,
+            ...[ '.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', '.java' ].map(e => base + e),
+            ...[ '.ts', '.tsx', '.js', '.jsx' ].map(e => base + '/index' + e),
+        ];
 
-        for (const ext of extensions) {
-            const withExt = resolved + ext;
-            if (fs.existsSync(withExt) && fs.statSync(withExt).isFile()) {
-                return path.relative(path.dirname(sourceFile), withExt);
-            }
-        }
-
-        // Try index files
-        for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
-            const indexPath = path.join(resolved, `index${ext}`);
-            if (fs.existsSync(indexPath) && fs.statSync(indexPath).isFile()) {
-                return path.relative(path.dirname(sourceFile), indexPath);
-            }
-        }
-
-        // Try as directory with package.json
-        const pkgPath = path.join(resolved, 'package.json');
-        if (fs.existsSync(pkgPath)) {
-            try {
-                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-                if (pkg.main) {
-                    const mainPath = path.join(resolved, pkg.main);
-                    if (fs.existsSync(mainPath)) {
-                        return path.relative(path.dirname(sourceFile), mainPath);
-                    }
-                }
-            } catch {
-                // Ignore package.json parse errors
+        for (const candidate of candidates) {
+            if (cachedRelPaths.has(candidate)) {
+                return candidate;
             }
         }
 
         return null;
-    }
-
-    /**
-     * Check if an import path is a relative import
-     */
-    isRelativeImport(importPath: string): boolean {
-        return importPath.startsWith('.');
-    }
-
-    /**
-     * Check if an import path is a node_modules import
-     */
-    isNodeModule(importPath: string): boolean {
-        return !importPath.startsWith('.') && !importPath.startsWith('/');
     }
 }

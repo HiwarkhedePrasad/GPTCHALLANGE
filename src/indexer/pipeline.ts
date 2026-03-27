@@ -1,31 +1,29 @@
 /**
- * Pipeline - Orchestrates all 6 phases of code analysis
- * Combines GitNexus-style multi-phase processing into a unified pipeline
+ * Pipeline — Orchestrates all 6 phases of code analysis.
+ *
+ * KEY CHANGE: Phase 0 loads every source file into a FileCache (RAM).
+ * Phases 2, 3a, 3b receive the cache instead of reading disk independently.
+ *
+ * Disk read count:  BEFORE → files × 3 processors  (e.g. 500 files = 1500 reads)
+ *                   AFTER  → files × 1              (e.g. 500 files = 500 reads)
+ *
+ * Memory cost:  ~10–40 MB for a typical 500-file repo (well within VS Code limits).
+ * The cache is released (GC'd) as soon as pipeline.execute() returns.
  */
 
 import * as vscode from 'vscode';
-import { GraphNode, GraphEdge, KnowledgeGraph, ClusterInfo } from './IndexerService';
+import { GraphNode, GraphEdge, KnowledgeGraph } from './IndexerService';
 
-// Phase 1: Structure
-import { FilesystemWalker, WalkResult } from './filesystem-walker';
-import { StructureProcessor, ProcessedStructure } from './structure-processor';
+import { FileCache } from './FileCache';
 
-// Phase 2: Parsing
-import { ParsingProcessor, ParsedSymbol } from './parsing-processor';
-import { TreeSitterQueries } from './tree-sitter-queries';
-
-// Phase 3: Resolution
-import { ImportProcessor } from './import-processor';
-import { CallProcessor, SymbolReference } from './call-processor';
-
-// Phase 4: Clustering
-import { CommunityProcessor, CommunityDetectionResult } from './community-processor';
-import { ClusterEnricher, EnrichedCluster } from './cluster-enricher';
-
-// Phase 5: Process/Execution
-import { ProcessProcessor, ProcessInfo } from './process-processor';
-
-// Phase 6: Search (built-in to IndexerService)
+import { FilesystemWalker }   from './filesystem-walker';
+import { StructureProcessor } from './structure-processor';
+import { ParsingProcessor }   from './parsing-processor';
+import { ImportProcessor }    from './import-processor';
+import { CallProcessor }      from './call-processor';
+import { CommunityProcessor } from './community-processor';
+import { ClusterEnricher }    from './cluster-enricher';
+import { ProcessProcessor }   from './process-processor';
 
 export interface PipelineProgress {
     phase: number;
@@ -36,204 +34,188 @@ export interface PipelineProgress {
 
 export interface PipelineConfig {
     excludePatterns: string[];
-    maxFileSize?: number;
+    maxFileSize?: number;       // bytes; default 512 KB
     supportedLanguages?: string[];
 }
 
 export class Pipeline {
-    private fsWalker: FilesystemWalker;
-    private structureProcessor: StructureProcessor;
-    private parsingProcessor: ParsingProcessor;
-    private treeSitterQueries: TreeSitterQueries;
-    private importProcessor: ImportProcessor;
-    private callProcessor: CallProcessor;
-    private communityProcessor: CommunityProcessor;
-    private clusterEnricher: ClusterEnricher;
-    private processProcessor: ProcessProcessor;
+    private readonly fsWalker          = new FilesystemWalker();
+    private readonly structureProc     = new StructureProcessor();
+    private readonly parsingProc       = new ParsingProcessor();
+    private readonly importProc        = new ImportProcessor();
+    private readonly callProc          = new CallProcessor();
+    private readonly communityProc     = new CommunityProcessor();
+    private readonly clusterEnricher   = new ClusterEnricher();
+    private readonly processProc       = new ProcessProcessor();
 
-    constructor() {
-        // Initialize all processors
-        this.fsWalker = new FilesystemWalker();
-        this.structureProcessor = new StructureProcessor();
-        this.parsingProcessor = new ParsingProcessor();
-        this.treeSitterQueries = new TreeSitterQueries();
-        this.importProcessor = new ImportProcessor();
-        this.callProcessor = new CallProcessor();
-        this.communityProcessor = new CommunityProcessor();
-        this.clusterEnricher = new ClusterEnricher();
-        this.processProcessor = new ProcessProcessor();
-    }
+    // ─── fast path ───────────────────────────────────────────────────────────
 
-    /**
-     * Fast structure-only execution - just file/folder nodes
-     * Completes in <1 second for most projects
-     */
+    /** Structure-only — shows the graph in <1 s without any file reads beyond the walk. */
     async executeStructureOnly(
         rootPath: string,
         config: PipelineConfig
     ): Promise<KnowledgeGraph> {
-        const nodes: GraphNode[] = [];
-        const edges: GraphEdge[] = [];
-        
-        // Only Phase 1: Structure
         const walkResult = await this.fsWalker.walk(rootPath, config.excludePatterns);
-        const structure = this.structureProcessor.process(
+        const structure  = this.structureProc.process(
             walkResult.files,
             rootPath,
-            (path, root) => this.fsWalker.getFileInfo(path, root)
+            (p, r) => this.fsWalker.getFileInfo(p, r)
         );
 
-        nodes.push(...structure.nodes);
-        edges.push(...structure.edges);
-
         return {
-            nodes,
-            edges,
+            nodes:    structure.nodes,
+            edges:    structure.edges,
             clusters: [],
             metadata: {
-                indexedAt: new Date().toISOString(),
-                fileCount: walkResult.files.length,
+                indexedAt:   new Date().toISOString(),
+                fileCount:   walkResult.files.length,
                 symbolCount: 0,
-                languages: Array.from(walkResult.languages)
-            }
+                languages:   [...walkResult.languages],
+            },
         };
     }
 
-    /**
-     * Full pipeline execution with all 6 phases
-     */
+    // ─── full pipeline ────────────────────────────────────────────────────────
+
     async execute(
         rootPath: string,
         progress: vscode.Progress<PipelineProgress>,
         token: vscode.CancellationToken,
         config: PipelineConfig
     ): Promise<KnowledgeGraph> {
-        const nodes: GraphNode[] = [];
-        const edges: GraphEdge[] = [];
+        const nodes: GraphNode[]  = [];
+        const edges: GraphEdge[]  = [];
+        let fileCount    = 0;
+        let symbolCount  = 0;
         let languages: Set<string> = new Set();
-        let fileCount = 0;
-        let symbolCount = 0;
 
-        // Helper to report progress
-        const report = (phase: number, phaseName: string, message: string, increment?: number) => {
+        const report = (phase: number, phaseName: string, message: string, increment?: number) =>
             progress.report({ phase, phaseName, message, increment });
+
+        const cancelled = () => {
+            if (token.isCancellationRequested) throw new Error('Indexing cancelled');
         };
 
         // ================================================================
-        // PHASE 1: Structure - Walk file tree and create file/folder nodes
+        // PHASE 0 (new): Walk filesystem + load ALL files into RAM
         // ================================================================
-        report(1, 'Structure', 'Scanning file structure...');
-
-        if (token.isCancellationRequested) {
-            throw new Error('Indexing cancelled');
-        }
+        report(0, 'Loading', 'Reading source files into memory...');
+        cancelled();
 
         const walkResult = await this.fsWalker.walk(rootPath, config.excludePatterns);
-        const structure = this.structureProcessor.process(
-            walkResult.files,
-            rootPath,
-            (path, root) => this.fsWalker.getFileInfo(path, root)
-        );
-
-        nodes.push(...structure.nodes);
-        edges.push(...structure.edges);
         fileCount = walkResult.files.length;
         languages = walkResult.languages;
 
-        report(1, 'Structure', `Found ${fileCount} files`, 16);
-
-        // ================================================================
-        // PHASE 2: Parsing - Extract symbols from files
-        // ================================================================
-        report(2, 'Parsing', 'Extracting symbols from files...');
-
-        if (token.isCancellationRequested) {
-            throw new Error('Indexing cancelled');
-        }
-
-        const symbolsByFile = await this.parsingProcessor.parseFiles(
+        const cache = new FileCache();
+        await cache.load(
             walkResult.files,
             rootPath,
-            (msg, current, total) => report(2, 'Parsing', msg)
+            config.maxFileSize ?? 512 * 1024,
+            (loaded, total) => report(0, 'Loading', `Loaded ${loaded}/${total} files into memory`)
         );
 
-        // Convert to symbol references for later phases
-        const symbolReferences = this.buildSymbolReferences(symbolsByFile, rootPath);
+        const ramMB = (cache.bytesUsed / 1024 / 1024).toFixed(1);
+        report(0, 'Loading', `${cache.size} files in RAM (${ramMB} MB)`, 10);
+        cancelled();
 
-        // Add symbol nodes with CONTAINS edges
-        for (const [filePath, symbols] of symbolsByFile.entries()) {
-            const relativePath = this.getRelativePath(filePath, rootPath);
+        // ================================================================
+        // PHASE 1: Structure — file/folder nodes (no file reads needed)
+        // ================================================================
+        report(1, 'Structure', 'Building file tree...');
+        cancelled();
 
-            for (const symbol of symbols) {
+        const structure = this.structureProc.process(
+            walkResult.files,
+            rootPath,
+            (p, r) => this.fsWalker.getFileInfo(p, r)
+        );
+        nodes.push(...structure.nodes);
+        edges.push(...structure.edges);
+
+        report(1, 'Structure', `Found ${fileCount} files`, 15);
+        cancelled();
+
+        // ================================================================
+        // PHASE 2: Parsing — extract symbols (RAM only)
+        // ================================================================
+        report(2, 'Parsing', 'Extracting symbols...');
+        cancelled();
+
+        const symbolsByFile = await this.parsingProc.parseFiles(
+            cache,
+            (msg, cur, tot) => report(2, 'Parsing', msg)
+        );
+
+        // Build relative-path→symbols lookup and add symbol nodes + CONTAINS edges
+        for (const [absPath, symbols] of symbolsByFile.entries()) {
+            const entry = cache.get(absPath);
+            if (!entry) continue;
+
+            const relPath = entry.relativePath.replace(/\\/g, '/');
+
+            for (const sym of symbols) {
                 symbolCount++;
-                const symbolId = `symbol:${relativePath}:${symbol.name}`;
+                const symId = `symbol:${relPath}:${sym.name}`;
 
                 nodes.push({
-                    id: symbolId,
-                    name: symbol.name,
-                    type: this.mapSymbolType(symbol.type),
-                    path: filePath,
-                    location: symbol.location,
-                    metadata: symbol.metadata
+                    id:       symId,
+                    name:     sym.name,
+                    type:     this.mapSymbolType(sym.type),
+                    path:     absPath,
+                    location: sym.location,
+                    metadata: sym.metadata,
                 });
 
-                // Add CONTAINS edge from file to symbol
                 edges.push({
-                    source: `file:${relativePath}`,
-                    target: symbolId,
-                    type: 'contains',
-                    weight: 1
+                    source: `file:${relPath}`,
+                    target: symId,
+                    type:   'contains',
+                    weight: 1,
                 });
             }
         }
 
-        report(2, 'Parsing', `Found ${symbolCount} symbols`, 16);
+        report(2, 'Parsing', `Found ${symbolCount} symbols`, 15);
+        cancelled();
 
         // ================================================================
-        // PHASE 3: Resolution - Resolve imports and calls
+        // PHASE 3: Resolution — imports + calls (RAM only)
         // ================================================================
-        report(3, 'Resolution', 'Resolving imports and references...');
+        report(3, 'Resolution', 'Resolving imports...');
+        cancelled();
 
-        if (token.isCancellationRequested) {
-            throw new Error('Indexing cancelled');
-        }
-
-        // Process imports - create IMPORTS edges
-        const importEdges = await this.importProcessor.process(
-            walkResult.files,
+        const importEdges = await this.importProc.process(
+            cache,
             rootPath,
-            (msg, current, total) => report(3, 'Resolution', msg)
+            (msg) => report(3, 'Resolution', msg)
         );
         edges.push(...importEdges);
 
-        // Process calls - create CALLS edges between functions
-        const callEdges = await this.callProcessor.process(
-            walkResult.files,
+        report(3, 'Resolution', 'Resolving call graph...');
+
+        const callEdges = await this.callProc.process(
+            cache,
+            symbolsByFile,
             rootPath,
-            symbolReferences,
-            (msg, current, total) => report(3, 'Resolution', msg)
+            (msg) => report(3, 'Resolution', msg)
         );
         edges.push(...callEdges);
 
-        report(3, 'Resolution', `Found ${importEdges.length + callEdges.length} references`, 16);
+        report(3, 'Resolution', `${importEdges.length} imports, ${callEdges.length} calls`, 15);
+        cancelled();
 
         // ================================================================
-        // PHASE 4: Clustering - Group related symbols into communities
+        // PHASE 4: Clustering (unchanged — pure in-memory graph algorithm)
         // ================================================================
-        report(4, 'Clustering', 'Detecting functional communities...');
+        report(4, 'Clustering', 'Detecting communities...');
+        cancelled();
 
-        if (token.isCancellationRequested) {
-            throw new Error('Indexing cancelled');
-        }
+        const communityResult = this.communityProc.process(nodes, edges);
 
-        const communityResult = this.communityProcessor.process(nodes, edges);
-
-        // Assign clusters to nodes
         for (const node of nodes) {
             node.cluster = communityResult.nodeClusterMap.get(node.id);
         }
 
-        // Enrich clusters with metadata
         const enrichedClusters = this.clusterEnricher.enrich(
             communityResult.clusters,
             nodes,
@@ -241,103 +223,59 @@ export class Pipeline {
             communityResult.nodeClusterMap
         );
 
-        report(4, 'Clustering', `Found ${communityResult.clusters.length} clusters`, 16);
+        report(4, 'Clustering', `${communityResult.clusters.length} clusters`, 15);
+        cancelled();
 
         // ================================================================
-        // PHASE 5: Process - Trace execution flows
+        // PHASE 5: Execution flows (unchanged)
         // ================================================================
         report(5, 'Execution', 'Tracing execution flows...');
+        cancelled();
 
-        if (token.isCancellationRequested) {
-            throw new Error('Indexing cancelled');
-        }
-
-        const processInfo = this.processProcessor.process(nodes, edges);
+        this.processProc.process(nodes, edges);
 
         // Calculate connection counts
-        const connectionCounts = this.calculateConnections(nodes, edges);
+        const connCounts = new Map<string, number>();
+        for (const edge of edges) {
+            connCounts.set(edge.source, (connCounts.get(edge.source) ?? 0) + 1);
+            connCounts.set(edge.target, (connCounts.get(edge.target) ?? 0) + 1);
+        }
         for (const node of nodes) {
-            node.connections = connectionCounts.get(node.id) || 0;
+            node.connections = connCounts.get(node.id) ?? 0;
         }
 
-        report(5, 'Execution', 'Execution flows traced', 16);
+        report(5, 'Execution', 'Done', 15);
 
-        // ================================================================
-        // PHASE 6: Search - Already handled by IndexerService using Fuse.js
-        // ================================================================
-        report(6, 'Search', 'Indexing complete...', 20);
-
-        // Build final graph
-        const graph: KnowledgeGraph = {
+        // cache goes out of scope here → GC reclaims the RAM
+        return {
             nodes,
             edges,
             clusters: enrichedClusters.map(c => ({
-                id: c.id,
-                name: c.name,
-                color: c.color,
-                nodeCount: c.nodeCount
+                id:        c.id,
+                name:      c.name,
+                color:     c.color,
+                nodeCount: c.nodeCount,
             })),
             metadata: {
-                indexedAt: new Date().toISOString(),
+                indexedAt:   new Date().toISOString(),
                 fileCount,
                 symbolCount,
-                languages: Array.from(languages)
-            }
+                languages:   [...languages],
+            },
         };
-
-        return graph;
     }
 
-    private buildSymbolReferences(
-        symbolsByFile: Map<string, ParsedSymbol[]>,
-        rootPath: string
-    ): Map<string, SymbolReference[]> {
-        const result = new Map<string, SymbolReference[]>();
-
-        for (const [filePath, symbols] of symbolsByFile.entries()) {
-            const refs: SymbolReference[] = symbols.map(s => ({
-                name: s.name,
-                filePath,
-                type: this.mapSymbolType(s.type) as 'function' | 'class' | 'interface' | 'method',
-                location: s.location
-            }));
-            result.set(filePath, refs);
-        }
-
-        return result;
-    }
-
-    private getRelativePath(filePath: string, rootPath: string): string {
-        // Simple path relative calculation
-        const normalizedRoot = rootPath.replace(/\\/g, '/');
-        const normalizedFile = filePath.replace(/\\/g, '/');
-
-        if (normalizedFile.startsWith(normalizedRoot)) {
-            return normalizedFile.substring(normalizedRoot.length).replace(/^\//, '');
-        }
-        return filePath;
-    }
+    // ─── helpers ─────────────────────────────────────────────────────────────
 
     private mapSymbolType(type: string): GraphNode['type'] {
-        const typeMap: Record<string, GraphNode['type']> = {
-            'function': 'function',
-            'class': 'class',
-            'interface': 'interface',
-            'method': 'method',
-            'variable': 'variable',
-            'type': 'interface'
+        const map: Record<string, GraphNode['type']> = {
+            function:  'function',
+            class:     'class',
+            interface: 'interface',
+            method:    'method',
+            variable:  'variable',
+            type:      'interface',
         };
-        return typeMap[type] || 'variable';
-    }
-
-    private calculateConnections(nodes: GraphNode[], edges: GraphEdge[]): Map<string, number> {
-        const counts = new Map<string, number>();
-
-        for (const edge of edges) {
-            counts.set(edge.source, (counts.get(edge.source) || 0) + 1);
-            counts.set(edge.target, (counts.get(edge.target) || 0) + 1);
-        }
-
-        return counts;
+        return map[type] ?? 'variable';
     }
 }
