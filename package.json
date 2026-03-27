@@ -1,0 +1,138 @@
+{
+  "name": "omnicode",
+  "displayName": "OmniCode",
+  "description": "Agentic AI coding assistant with visual codebase mapping",
+  "version": "0.2.0",
+  "publisher": "omnicode",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omnicode/omnicode-vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "coding assistant",
+    "knowledge graph",
+    "codebase visualization",
+    "agentic"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "omnicode.openGraph",
+        "title": "OmniCode: Open Knowledge Graph"
+      },
+      {
+        "command": "omnicode.indexWorkspace",
+        "title": "OmniCode: Index Workspace"
+      },
+      {
+        "command": "omnicode.askAgent",
+        "title": "OmniCode: Ask Agent"
+      },
+      {
+        "command": "omnicode.configureApiKey",
+        "title": "OmniCode: Configure API Key"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "omnicode",
+          "title": "OmniCode",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "omnicode": [
+        {
+          "type": "webview",
+          "id": "omnicode.graphView",
+          "name": "Knowledge Graph"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OmniCode",
+      "properties": {
+        "omnicode.llm.provider": {
+          "type": "string",
+          "enum": ["openai", "anthropic", "gemini"],
+          "default": "openai",
+          "description": "LLM provider to use for the agent"
+        },
+        "omnicode.llm.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the LLM provider (stored securely)"
+        },
+        "omnicode.llm.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model to use (leave empty for provider default: gpt-4o, claude-sonnet-4-20250514, gemini-1.5-pro)"
+        },
+        "omnicode.indexer.excludePatterns": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/__pycache__/**",
+            "**/.venv/**",
+            "**/vendor/**"
+          ],
+          "description": "Glob patterns to exclude from indexing"
+        },
+        "omnicode.agent.confirmDangerousOperations": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require confirmation for file writes and terminal commands"
+        },
+        "omnicode.agent.maxIterations": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum iterations for the agent loop"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "npm run build -- --watch --sourcemap",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.19.8",
+    "eslint": "^8.55.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "fuse.js": "^7.0.0",
+    "ignore": "^5.3.0"
+  }
+}
