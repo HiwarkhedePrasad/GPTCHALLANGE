@@ -5,6 +5,10 @@ import Fuse from 'fuse.js';
 import { Pipeline } from './pipeline';
 import { PipelineProgress } from './pipeline';
 
+// Embedding imports
+import { runEmbeddingPipeline, semanticSearch as embeddingSearch, clearEmbeddings } from './embedding-pipeline';
+import { EmbeddingProgress } from './embedding-types';
+
 export interface GraphNode {
     id: string;
     name: string;
@@ -12,7 +16,7 @@ export interface GraphNode {
     path?: string;
     cluster?: number;
     connections?: number;
-    location?: { line: number; column: number };
+    location?: { line: number; column: number; endLine?: number };
     metadata?: Record<string, unknown>;
 }
 
@@ -269,5 +273,69 @@ export class IndexerService {
 
     getAllClusters(): ClusterInfo[] {
         return this.currentGraph?.clusters || [];
+    }
+
+    /**
+     * Generate embeddings for the current knowledge graph
+     * This enables semantic search capabilities
+     */
+    async generateEmbeddings(
+        progress: vscode.Progress<{ message?: string; increment?: number }>
+    ): Promise<void> {
+        if (!this.currentGraph) {
+            throw new Error('No graph indexed yet. Run indexWorkspace first.');
+        }
+
+        const embeddingProgress: vscode.Progress<EmbeddingProgress> = {
+            report: (p: EmbeddingProgress) => {
+                const message = p.phase === 'loading-model'
+                    ? 'Loading embedding model...'
+                    : p.phase === 'embedding'
+                        ? `Embedding nodes: ${p.nodesProcessed}/${p.totalNodes}`
+                        : p.phase === 'indexing'
+                            ? 'Building search index...'
+                            : p.phase === 'ready'
+                                ? 'Embeddings ready'
+                                : p.error || 'Processing...';
+                progress.report({ message, increment: Math.round(p.percent) });
+            }
+        };
+
+        await runEmbeddingPipeline(this.currentGraph, embeddingProgress);
+    }
+
+    /**
+     * Perform semantic search using embeddings
+     * Requires generateEmbeddings to be called first
+     */
+    async semanticSearch(query: string, limit: number = 10): Promise<Array<{
+        nodeId: string;
+        name: string;
+        type: string;
+        path?: string;
+        location?: { line: number; column: number; endLine?: number };
+        distance: number;
+    }>> {
+        if (!this.currentGraph) {
+            return [];
+        }
+
+        const results = await embeddingSearch(query, this.currentGraph, limit, 0.8);
+
+        return results.map(r => ({
+            nodeId: r.nodeId,
+            name: r.name,
+            type: r.label,
+            path: r.filePath,
+            location: r.startLine ? { line: r.startLine, column: 0, endLine: r.endLine } : undefined,
+            distance: r.distance
+        }));
+    }
+
+    /**
+     * Clear embeddings to free memory
+     */
+    clearEmbeddings(): void {
+        clearEmbeddings();
     }
 }

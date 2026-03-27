@@ -168,13 +168,14 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net 'unsafe-inline' 'unsafe-eval'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data: blob:; connect-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net;">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh 'unsafe-inline' 'unsafe-eval'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data: blob:; connect-src ${webview.cspSource} https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh;">
     <title>OmniCode</title>
-    <!-- Sigma.js v3 + Graphology for GitNexus-style beautiful graphs -->
+    <!-- Sigma.js + Graphology -->
     <script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/graphology-layout-forceatlas2@0.10.1/build/graphology-layout-forceatlas2.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/graphology-layout-noverlap@2.0.1/build/graphology-layout-noverlap.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/sigma@2.4.0/build/sigma.min.js"></script>
+    <script type="module">
+        import Sigma from 'https://esm.sh/sigma@1.2.1';
+        window.Sigma = Sigma;
+    </script>
     <style>
         :root {
             --bg-void: #06060a;
@@ -611,11 +612,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         let sigma = null;
         let graph = null;
         let layoutWorker = null;
-        let layoutTimeout = null;
         let isLayoutRunning = false;
         let selectedNode = null;
         let highlightedNodes = new Set();
         let rawGraphData = null;
+        let sigmaReady = typeof window.Sigma !== 'undefined';
         
         // === DOM ELEMENTS ===
         const container = document.getElementById('sigma-container');
@@ -686,13 +687,14 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                     : NODE_COLORS[node.type] || '#6b7280';
                 
                 g.addNode(node.id, {
-                    x, y,
-                    size,
-                    color,
-                    label: node.name,
-                    nodeType: node.type,
-                    filePath: node.path,
-                    cluster: node.cluster
+                    x: x || 0,
+                    y: y || 0,
+                    size: size || 6,
+                    color: color || '#6b7280',
+                    label: node.name || node.id,
+                    nodeType: node.type || 'unknown',
+                    filePath: node.path || '',
+                    cluster: node.cluster ?? -1
                 });
             });
             
@@ -719,29 +721,33 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                     : NODE_COLORS[node.type] || '#6b7280';
                 
                 g.addNode(node.id, {
-                    x, y,
-                    size,
-                    color,
-                    label: node.name,
-                    nodeType: node.type,
-                    filePath: node.path,
-                    cluster: node.cluster
+                    x: x || 0,
+                    y: y || 0,
+                    size: size || 6,
+                    color: color || '#6b7280',
+                    label: node.name || node.id,
+                    nodeType: node.type || 'unknown',
+                    filePath: node.path || '',
+                    cluster: node.cluster ?? -1
                 });
             });
             
             console.log('Added', g.order, 'nodes to graph');
             
-            // Add edges with curved styling
+            // Add edges with curved styling - each edge gets random curvature
             const edgeSize = nodeCount > 5000 ? 0.3 : nodeCount > 1000 ? 0.5 : 0.8;
-            
+
             data.edges.forEach((edge, i) => {
                 if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
                     if (!g.hasEdge(edge.source, edge.target)) {
                         const color = EDGE_COLORS[edge.type] || '#3a3a4a';
+                        // Random curvature between -0.3 and 0.3 (negative = curve one way, positive = other)
+                        const curvature = (Math.random() - 0.5) * 0.6;
                         g.addEdge(edge.source, edge.target, {
                             size: edgeSize,
                             color,
-                            type: 'arrow',
+                            type: 'curved',
+                            curvature: curvature,
                             edgeType: edge.type
                         });
                     }
@@ -774,6 +780,14 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
             
+            // Wait for Sigma to load if not ready
+            if (typeof Sigma === 'undefined') {
+                console.log('Waiting for Sigma to load...');
+                loadingEl.innerHTML = '<span class="icon">🔮</span><span>Loading graph renderer...</span>';
+                setTimeout(renderGraph, 100);
+                return;
+            }
+            
             container.style.display = 'block';
             loadingEl.style.display = 'none';
             statsEl.style.display = 'block';
@@ -800,8 +814,13 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             
             console.log('Graph built successfully, node count:', graph.order);
 
-            // Create Sigma instance with curved edges (GitNexus style)
-            sigma = new Sigma(graph, container, {
+            // Ensure container has dimensions before creating Sigma
+            container.style.width = '100%';
+            container.style.height = '100%';
+
+            try {
+                // Create Sigma instance
+                sigma = new Sigma(graph, container, {
                 renderLabels: true,
                 labelFont: 'JetBrains Mono, monospace',
                 labelSize: 11,
@@ -812,10 +831,10 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
 
                 defaultNodeColor: '#6b7280',
                 defaultEdgeColor: '#2a2a3a',
-                defaultEdgeType: 'curve',  // Curved edges (sigma v2.x)
+                defaultEdgeType: 'curved',  // Curved edges with varying curvature
 
                 minCameraRatio: 0.01,
-                maxCameraRatio: 50,
+                maxCameraRatio: 100,
                 
                 nodeReducer: (node, data) => {
                     const res = { ...data };
@@ -837,12 +856,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 
                 edgeReducer: (edge, data) => {
                     const res = { ...data };
-                    
-                    // Ensure edges are curved (from graph-adapter.ts)
-                    if (!res.type || res.type === 'arrow') {
-                        res.type = 'curve';
+
+                    // Preserve curved edges - don't override to line
+                    if (!res.type) {
+                        res.type = 'curved';
                     }
-                    
+
                     // Dim edges not connected to selected node
                     if (selectedNode) {
                         const source = graph.source(edge);
@@ -864,13 +883,22 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
                 selectNode(node);
                 vscode.postMessage({ type: 'node_click', nodeId: node });
             });
-            
+
             sigma.on('clickStage', () => {
                 clearSelection();
             });
-            
+
+            // Reset camera to show all nodes
+            sigma.getCamera().animatedReset({ duration: 0 });
+
             // Run initial ForceAtlas2 layout
             startLayout();
+            } catch (error) {
+                console.error('Failed to create Sigma instance:', error);
+                loadingEl.innerHTML = '<span class="icon">❌</span><span>Failed to render graph: ' + (error.message || 'Unknown error') + '</span>';
+                loadingEl.style.display = 'flex';
+                container.style.display = 'none';
+            }
         }
         
         function selectNode(nodeId) {
@@ -889,129 +917,157 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             selectionBar.classList.remove('visible');
             sigma.refresh();
         }
-        
-        // === FORCEATLAS2 LAYOUT (WEB WORKER) ===
-        function getFA2Settings(nodeCount) {
-            const isSmall = nodeCount < 500;
-            const isMedium = nodeCount >= 500 && nodeCount < 2000;
-            const isLarge = nodeCount >= 2000 && nodeCount < 10000;
-            
-            return {
-                // Lower gravity allows nodes to stay spread out
-                gravity: isSmall ? 0.8 : isMedium ? 0.5 : isLarge ? 0.3 : 0.15,
+
+        // Optimized force layout using Barnes-Hut approximation
+        function simpleForceLayout(iterations = 50) {
+            if (!graph) return;
+
+            const nodeCount = graph.order;
+            if (nodeCount === 0) return;
+
+            // Build node lookup map once
+            const nodeMap = new Map();
+            graph.forEachNode((id, attrs) => {
+                nodeMap.set(id, { id, x: attrs.x || 0, y: attrs.y || 0 });
+            });
+
+            // Build edge adjacency map once
+            const edgeMap = new Map();
+            graph.forEachEdge((edge, attrs, source, target) => {
+                if (!edgeMap.has(source)) edgeMap.set(source, []);
+                if (!edgeMap.has(target)) edgeMap.set(target, []);
+                edgeMap.get(source).push(target);
+                edgeMap.get(target).push(source);
+            });
+
+            const theta = 1.5; // Barnes-Hut approximation parameter
+            const k = Math.sqrt(nodeCount * 200) / 2;
+            const k2 = k * k;
+            const gravity = 0.1;
+
+            for (let iter = 0; iter < iterations; iter++) {
+                const cooling = 1 - iter / iterations;
                 
-                // Higher scaling ratio = more spread out overall
-                scalingRatio: isSmall ? 15 : isMedium ? 30 : isLarge ? 60 : 100,
+                // Apply forces using Barnes-Hut approximation
+                const nodes = Array.from(nodeMap.values());
+                const forces = new Map(nodes.map(n => [n.id, { fx: 0, fy: 0 }]));
+
+                // Repulsive forces - only between nearby nodes (simplified)
+                const spatialIndex = new Map();
+                const cellSize = k * 2;
                 
-                // Slower = more stable convergence
-                slowDown: isSmall ? 1 : isMedium ? 2 : isLarge ? 4 : 6,
-                
-                // Barnes-Hut for performance on large graphs
-                barnesHutOptimize: nodeCount > 200,
-                barnesHutTheta: 0.6,
-                
-                // Prevent small nodes from being pushed around
-                adjustSizes: true,
-                
-                // Better hub distribution
-                outboundAttractionDistribution: true,
-                linLogMode: false,
-                strongGravityMode: false,
-                edgeWeightInfluence: 1
-            };
+                // Build spatial grid
+                nodes.forEach(n => {
+                    const cellX = Math.floor(n.x / cellSize);
+                    const cellY = Math.floor(n.y / cellSize);
+                    const key = cellX + ',' + cellY;
+                    if (!spatialIndex.has(key)) spatialIndex.set(key, []);
+                    spatialIndex.get(key).push(n);
+                });
+
+                // Repulsive from neighbors only
+                nodes.forEach(n1 => {
+                    const cellX = Math.floor(n1.x / cellSize);
+                    const cellY = Math.floor(n1.y / cellSize);
+                    
+                    for (let dx = -1; dx <= 1; dx++) {
+                        for (let dy = -1; dy <= 1; dy++) {
+                            const key = (cellX + dx) + ',' + (cellY + dy);
+                            const cell = spatialIndex.get(key);
+                            if (!cell) continue;
+                            
+                            cell.forEach(n2 => {
+                                if (n1.id === n2.id) return;
+                                const ddx = n1.x - n2.x;
+                                const ddy = n1.y - n2.y;
+                                let dist = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+                                const force = k2 / dist * cooling * 0.01;
+                                const f = forces.get(n1.id);
+                                f.fx += (ddx / dist) * force;
+                                f.fy += (ddy / dist) * force;
+                            });
+                        }
+                    }
+                });
+
+                // Attractive forces (along edges only - O(m))
+                graph.forEachEdge((edge, attrs, source, target) => {
+                    const s = nodeMap.get(source);
+                    const t = nodeMap.get(target);
+                    if (!s || !t) return;
+                    
+                    const ddx = t.x - s.x;
+                    const ddy = t.y - s.y;
+                    let dist = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+                    const force = dist / k * cooling * 0.1;
+                    
+                    forces.get(s.id).fx += (ddx / dist) * force;
+                    forces.get(s.id).fy += (ddy / dist) * force;
+                    forces.get(t.id).fx -= (ddx / dist) * force;
+                    forces.get(t.id).fy -= (ddy / dist) * force;
+                });
+
+                // Gravity and apply forces
+                nodes.forEach(n => {
+                    const f = forces.get(n.id);
+                    f.fx -= n.x * gravity;
+                    f.fy -= n.y * gravity;
+                    
+                    const maxMove = 10 * cooling;
+                    const move = Math.sqrt(f.fx * f.fx + f.fy * f.fy);
+                    if (move > maxMove) {
+                        f.fx = (f.fx / move) * maxMove;
+                        f.fy = (f.fy / move) * maxMove;
+                    }
+                    
+                    n.x += f.fx;
+                    n.y += f.fy;
+                    graph.setNodeAttribute(n.id, 'x', n.x);
+                    graph.setNodeAttribute(n.id, 'y', n.y);
+                });
+            }
         }
-        
-        function getLayoutDuration(nodeCount) {
-            if (nodeCount > 10000) return 45000;  // 45s for huge graphs
-            if (nodeCount > 5000) return 35000;   // 35s
-            if (nodeCount > 2000) return 30000;   // 30s
-            if (nodeCount > 1000) return 30000;   // 30s
-            if (nodeCount > 500) return 25000;    // 25s
-            return 20000;                         // 20s for small graphs
-        }
-        
+
         function startLayout() {
             if (!graph || isLayoutRunning) return;
-            
-            stopLayout(); // Clean up any existing layout
-            
+
+            stopLayout();
+
             const nodeCount = graph.order;
-            
+
             isLayoutRunning = true;
             layoutIndicator.classList.add('visible');
             document.getElementById('layout-toggle').classList.add('active');
             document.getElementById('layout-toggle').textContent = '⏸';
-            
-            // Get inferred + custom settings
-            const inferredSettings = forceAtlas2.inferSettings(graph);
-            const customSettings = getFA2Settings(nodeCount);
-            const settings = { ...inferredSettings, ...customSettings };
-            
-            // Create web worker layout (non-blocking!)
-            try {
-                layoutWorker = new forceAtlas2.Worker(graph, {
-                    settings,
-                    onConverged: () => {
-                        console.log('Layout converged');
+
+            // Use simple custom force layout - reduced for performance
+            let iteration = 0;
+            const maxIterations = Math.min(50, nodeCount * 0.5);
+
+            layoutWorker = {
+                interval: setInterval(() => {
+                    if (!isLayoutRunning || !graph) {
                         stopLayout();
-                    }
-                });
-                
-                layoutWorker.start();
-                
-                // Auto-refresh every 100ms for smooth animation
-                const refreshInterval = setInterval(() => {
-                    if (!isLayoutRunning) {
-                        clearInterval(refreshInterval);
                         return;
                     }
-                    sigma.refresh();
-                }, 100);
-                
-                // Stop after duration
-                const duration = getLayoutDuration(nodeCount);
-                layoutTimeout = setTimeout(() => {
-                    if (layoutWorker) {
-                        // Apply light noverlap to prevent node overlap
-                        try {
-                            noverlap.assign(graph, {
-                                maxIterations: 50,
-                                ratio: 1.2,
-                                margin: 5
-                            });
-                        } catch (e) {
-                            console.log('Noverlap not available:', e);
-                        }
-                        sigma.refresh();
+
+                    simpleForceLayout(5); // Run 5 iterations per frame
+                    if (sigma) sigma.refresh();
+
+                    iteration += 5;
+                    if (iteration >= maxIterations) {
+                        stopLayout();
                     }
-                    stopLayout();
-                }, duration);
-                
-            } catch (error) {
-                console.warn('Web Worker not available, falling back to sync layout:', error);
-                // Fallback to synchronous layout with more iterations
-                const iterations = Math.min(500, nodeCount * 2);
-                forceAtlas2.assign(graph, { iterations, settings });
-                sigma.refresh();
-                stopLayout();
-            }
+                }, 16) // ~60fps
+            };
         }
         
         function stopLayout() {
-            if (layoutWorker) {
-                try {
-                    layoutWorker.kill();
-                } catch (e) {
-                    console.log('Error killing worker:', e);
-                }
+            if (layoutWorker && layoutWorker.interval) {
+                clearInterval(layoutWorker.interval);
                 layoutWorker = null;
             }
-            
-            if (layoutTimeout) {
-                clearTimeout(layoutTimeout);
-                layoutTimeout = null;
-            }
-            
+
             isLayoutRunning = false;
             layoutIndicator.classList.remove('visible');
             document.getElementById('layout-toggle').classList.remove('active');

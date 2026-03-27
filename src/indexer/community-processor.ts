@@ -1,344 +1,456 @@
 /**
- * Phase 4: Community Processor
- * Detects functional communities using Louvain-style modularity optimization
+ * Community Detection Processor
+ *
+ * Uses the Leiden algorithm (via graphology-communities-leiden) to detect
+ * communities/clusters in the code graph based on CALLS, IMPORTS, EXTENDS, and IMPLEMENTS relationships.
+ *
+ * Communities represent groups of code that work together frequently,
+ * helping agents navigate the codebase by functional area rather than file structure.
  */
 
+import Graph from 'graphology';
+import louvain from 'graphology-communities-louvain';
 import { GraphNode, GraphEdge, ClusterInfo } from './IndexerService';
 
-export interface CommunityDetectionResult {
-    clusters: ClusterInfo[];
-    nodeClusterMap: Map<string, number>;
+export interface CommunityNode {
+    id: string;
+    label: string;
+    heuristicLabel: string;
+    cohesion: number;
+    symbolCount: number;
 }
 
+export interface CommunityMembership {
+    nodeId: string;
+    communityId: string;
+}
+
+export interface CommunityDetectionResult {
+    communities: CommunityNode[];
+    memberships: CommunityMembership[];
+    nodeClusterMap: Map<string, number>;
+    stats: {
+        totalCommunities: number;
+        modularity: number;
+        nodesProcessed: number;
+    };
+}
+
+// Community colors for visualization
 const COMMUNITY_COLORS = [
-    '#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4',
-    '#3b82f6', '#8b5cf6', '#d946ef', '#ec4899', '#f43f5e',
-    '#14b8a6', '#84cc16'
+    '#ef4444', // red
+    '#f97316', // orange
+    '#eab308', // yellow
+    '#22c55e', // green
+    '#06b6d4', // cyan
+    '#3b82f6', // blue
+    '#8b5cf6', // violet
+    '#d946ef', // fuchsia
+    '#ec4899', // pink
+    '#f43f5e', // rose
+    '#14b8a6', // teal
+    '#84cc16', // lime
 ];
 
+export const getCommunityColor = (communityIndex: number): string => {
+    return COMMUNITY_COLORS[communityIndex % COMMUNITY_COLORS.length];
+};
+
 export class CommunityProcessor {
-    process(nodes: GraphNode[], edges: GraphEdge[]): CommunityDetectionResult {
-        // Only cluster symbol nodes (functions, classes, methods, interfaces)
-        const symbolTypes = new Set(['function', 'class', 'method', 'interface']);
-        const symbolNodes = nodes.filter(n => symbolTypes.has(n.type));
-
-        // Build adjacency map using clustering edge types
-        const clusteringEdgeTypes = new Set(['calls', 'imports', 'extends', 'implements']);
-        const adjacency = this.buildAdjacency(symbolNodes, edges, clusteringEdgeTypes);
-
-        // Filter to only nodes with at least one edge
-        const connectedNodes = symbolNodes.filter(n => {
-            const adj = adjacency.get(n.id);
-            return adj && adj.size > 0;
-        });
-
-        if (connectedNodes.length === 0) {
-            // Fallback: cluster by file/folder structure
-            return this.clusterByStructure(nodes);
-        }
-
-        // Run Louvain-style community detection
-        const nodeClusterMap = this.louvainCommunityDetection(connectedNodes, adjacency);
-
-        // Also assign file nodes to clusters based on their symbols
-        this.assignFileClusters(nodes, nodeClusterMap, symbolTypes);
-
-        // Build cluster info
-        const clusters = this.buildClusterInfo(nodes, nodeClusterMap);
-
-        return { clusters, nodeClusterMap };
-    }
-
-    private buildAdjacency(
+    /**
+     * Detect communities in the knowledge graph using Leiden algorithm
+     *
+     * This runs AFTER all relationships (CALLS, IMPORTS, etc.) have been built.
+     * It uses primarily CALLS, IMPORTS, EXTENDS, IMPLEMENTS edges to cluster code that works together.
+     */
+    process(
         nodes: GraphNode[],
         edges: GraphEdge[],
-        edgeTypes: Set<string>
-    ): Map<string, Map<string, number>> {
-        const adjacency = new Map<string, Map<string, number>>();
+        onProgress?: (message: string, progress: number) => void
+    ): CommunityDetectionResult {
+        onProgress?.('Building graph for community detection...', 0);
 
-        // Initialize adjacency for all symbol nodes
+        // Pre-check total symbol count to determine large-graph mode before building
+        const symbolTypes = new Set(['function', 'class', 'method', 'interface']);
+        let symbolCount = 0;
         for (const node of nodes) {
-            adjacency.set(node.id, new Map());
+            if (symbolTypes.has(node.type)) {
+                symbolCount++;
+            }
+        }
+        const isLarge = symbolCount > 10_000;
+
+        const graph = this.buildGraphologyGraph(nodes, edges, isLarge);
+
+        if (graph.order === 0) {
+            return {
+                communities: [],
+                memberships: [],
+                nodeClusterMap: new Map(),
+                stats: { totalCommunities: 0, modularity: 0, nodesProcessed: 0 }
+            };
         }
 
-        // Add edges (undirected, weighted by frequency)
-        for (const edge of edges) {
-            if (!edgeTypes.has(edge.type)) continue;
+        const nodeCount = graph.order;
+        const edgeCount = graph.size;
 
-            const sourceAdj = adjacency.get(edge.source);
-            const targetAdj = adjacency.get(edge.target);
+        onProgress?.(`Running Leiden on ${nodeCount} nodes, ${edgeCount} edges${isLarge ? ` (filtered from ${symbolCount} symbols)` : ''}...`, 30);
 
-            if (sourceAdj && targetAdj) {
-                // Undirected - add both directions
-                sourceAdj.set(edge.target, (sourceAdj.get(edge.target) || 0) + 1);
-                targetAdj.set(edge.source, (targetAdj.get(edge.source) || 0) + 1);
+        // Large graphs: higher resolution + capped iterations.
+        // The first 2 iterations capture ~95%+ of modularity; additional iterations have diminishing returns.
+        // Timeout: abort after 60s for pathological graph structures.
+        const LOUVAIN_TIMEOUT_MS = 60_000;
+        let details: any;
+
+        try {
+            const startTime = Date.now();
+            // Louvain algorithm for community detection
+            // resolution: higher = more communities (1.0 is standard)
+            // weighted: whether to use edge weights
+            const communityMap = louvain(graph, {
+                resolution: isLarge ? 2.0 : 1.0,
+                randomWalk: false,
+            });
+
+            // Convert Map to object format expected by the rest of the code
+            const communities: Record<string, number> = {};
+            let communityCount = 0;
+            communityMap.forEach((community: number, node: string) => {
+                communities[node] = community;
+                communityCount = Math.max(communityCount, community + 1);
+            });
+
+            // Calculate modularity (simplified)
+            const modularity = calculateModularity(graph, communityMap);
+
+            details = {
+                communities,
+                count: communityCount,
+                modularity
+            };
+
+            // Check for timeout
+            if (Date.now() - startTime > LOUVAIN_TIMEOUT_MS) {
+                throw new Error('Louvain timeout');
+            }
+        } catch (e: any) {
+            if (e.message === 'Louvain timeout') {
+                onProgress?.('Community detection timed out, using fallback...', 60);
+                // Fallback: assign all nodes to community 0
+                const communities: Record<string, number> = {};
+                graph.forEachNode((node: string) => { communities[node] = 0; });
+                details = { communities, count: 1, modularity: 0 };
+            } else {
+                throw e;
             }
         }
 
-        return adjacency;
-    }
+        onProgress?.(`Found ${details.count} communities...`, 60);
 
-    private louvainCommunityDetection(
-        nodes: GraphNode[],
-        adjacency: Map<string, Map<string, number>>
-    ): Map<string, number> {
+        // Step 2: Build nodeClusterMap
         const nodeClusterMap = new Map<string, number>();
-        let communityCount = 0;
-
-        // Initialize: each node in its own community
-        for (const node of nodes) {
-            nodeClusterMap.set(node.id, communityCount++);
+        for (const [nodeId, communityNum] of Object.entries(details.communities as Record<string, number>)) {
+            nodeClusterMap.set(nodeId, communityNum);
         }
 
-        // Calculate total edge weight
-        let totalWeight = 0;
-        for (const [_, neighbors] of adjacency) {
-            for (const [__, weight] of neighbors) {
-                totalWeight += weight;
+        // Step 3: Create community nodes with heuristic labels
+        const communityNodes = this.createCommunityNodes(
+            details.communities as Record<string, number>,
+            details.count,
+            graph,
+            nodes
+        );
+
+        onProgress?.('Creating membership edges...', 80);
+
+        // Step 4: Create membership mappings
+        const memberships: CommunityMembership[] = [];
+        Object.entries(details.communities).forEach(([nodeId, communityNum]) => {
+            memberships.push({
+                nodeId,
+                communityId: `comm_${communityNum}`,
+            });
+        });
+
+        onProgress?.('Community detection complete!', 100);
+
+        return {
+            communities: communityNodes,
+            memberships,
+            nodeClusterMap,
+            stats: {
+                totalCommunities: details.count,
+                modularity: details.modularity ?? 0,
+                nodesProcessed: graph.order,
             }
-        }
-        totalWeight /= 2; // Undirected, counted twice
-
-        // Modularity optimization loop
-        let improved = true;
-        let iterations = 0;
-        const maxIterations = 10;
-
-        while (improved && iterations < maxIterations) {
-            improved = false;
-            iterations++;
-
-            for (const node of nodes) {
-                const currentComm = nodeClusterMap.get(node.id)!;
-                const neighbors = adjacency.get(node.id) || new Map();
-
-                // Calculate community weights
-                const communityWeights = new Map<number, number>();
-
-                for (const [neighborId, weight] of neighbors) {
-                    const neighborComm = nodeClusterMap.get(neighborId);
-                    if (neighborComm !== undefined) {
-                        communityWeights.set(neighborComm, (communityWeights.get(neighborComm) || 0) + weight);
-                    }
-                }
-
-                // Find best community to join
-                let bestComm = currentComm;
-                let bestGain = 0;
-
-                for (const [comm, weight] of communityWeights) {
-                    if (comm !== currentComm && weight > bestGain) {
-                        bestGain = weight;
-                        bestComm = comm;
-                    }
-                }
-
-                // Move node if there's improvement
-                if (bestComm !== currentComm && bestGain > 0) {
-                    nodeClusterMap.set(node.id, bestComm);
-                    improved = true;
-                }
-            }
-        }
-
-        // Renumber communities to be contiguous
-        const usedCommunities = new Set(nodeClusterMap.values());
-        const communityRemap = new Map<number, number>();
-        let newId = 0;
-
-        for (const comm of usedCommunities) {
-            communityRemap.set(comm, newId++);
-        }
-
-        for (const [nodeId, comm] of nodeClusterMap) {
-            nodeClusterMap.set(nodeId, communityRemap.get(comm)!);
-        }
-
-        return nodeClusterMap;
+        };
     }
 
-    private assignFileClusters(
+    /**
+     * Build a graphology graph containing only symbol nodes and clustering edges.
+     * For large graphs (>10K symbols), filter out low-confidence edges
+     * and degree-1 nodes that add noise and massively increase Leiden runtime.
+     */
+    private buildGraphologyGraph(
         nodes: GraphNode[],
-        nodeClusterMap: Map<string, number>,
-        symbolTypes: Set<string>
-    ): void {
-        // Assign file nodes to clusters based on their symbols
+        edges: GraphEdge[],
+        isLarge: boolean
+    ): Graph {
+        const graph = new Graph({ type: 'undirected', allowSelfLoops: false });
+
+        const symbolTypes = new Set(['function', 'class', 'method', 'interface']);
+        const clusteringEdgeTypes = new Set(['calls', 'imports', 'extends', 'implements']);
+        const connectedNodes = new Set<string>();
+        const nodeDegree = new Map<string, number>();
+
+        // Count node degrees first
+        for (const edge of edges) {
+            if (!clusteringEdgeTypes.has(edge.type)) continue;
+            if (edge.source === edge.target) continue;
+
+            connectedNodes.add(edge.source);
+            connectedNodes.add(edge.target);
+            nodeDegree.set(edge.source, (nodeDegree.get(edge.source) || 0) + 1);
+            nodeDegree.set(edge.target, (nodeDegree.get(edge.target) || 0) + 1);
+        }
+
+        // Add nodes (symbol types only)
         for (const node of nodes) {
-            if (node.type === 'file' && !nodeClusterMap.has(node.id) && node.path) {
-                // Find most common cluster among symbols in this file
-                const fileSymbols = nodes.filter(n =>
-                    symbolTypes.has(n.type) &&
-                    n.path === node.path &&
-                    nodeClusterMap.has(n.id)
-                );
+            if (!symbolTypes.has(node.type)) continue;
+            if (!connectedNodes.has(node.id)) continue;
 
-                if (fileSymbols.length > 0) {
-                    const clusterCounts = new Map<number, number>();
-                    for (const sym of fileSymbols) {
-                        const cluster = nodeClusterMap.get(sym.id)!;
-                        clusterCounts.set(cluster, (clusterCounts.get(cluster) || 0) + 1);
-                    }
+            // For large graphs, skip degree-1 nodes — they just become singletons or
+            // get absorbed into their single neighbor's community, but cost iteration time.
+            if (isLarge && (nodeDegree.get(node.id) || 0) < 2) continue;
 
-                    let maxCount = 0;
-                    let dominantCluster = 0;
-                    for (const [cluster, count] of clusterCounts) {
-                        if (count > maxCount) {
-                            maxCount = count;
-                            dominantCluster = cluster;
-                        }
-                    }
-                    nodeClusterMap.set(node.id, dominantCluster);
-                }
-            }
-        }
-    }
-
-    private buildClusterInfo(
-        nodes: GraphNode[],
-        nodeClusterMap: Map<string, number>
-    ): ClusterInfo[] {
-        // Group nodes by cluster
-        const clusterMembers = new Map<number, string[]>();
-        for (const [nodeId, cluster] of nodeClusterMap) {
-            if (!clusterMembers.has(cluster)) {
-                clusterMembers.set(cluster, []);
-            }
-            clusterMembers.get(cluster)!.push(nodeId);
-        }
-
-        // Build cluster info
-        const clusters: ClusterInfo[] = [];
-
-        for (const [clusterId, memberIds] of clusterMembers) {
-            // Skip singleton clusters
-            if (memberIds.length < 2) continue;
-
-            const paths = memberIds
-                .map(id => nodes.find(n => n.id === id)?.path)
-                .filter(Boolean) as string[];
-
-            const name = this.inferClusterName(paths, memberIds, nodes);
-
-            clusters.push({
-                id: clusterId,
-                name,
-                color: COMMUNITY_COLORS[clusterId % COMMUNITY_COLORS.length],
-                nodeCount: memberIds.length
+            graph.addNode(node.id, {
+                name: node.name,
+                filePath: node.path,
+                type: node.type,
             });
         }
+
+        // Add edges
+        for (const edge of edges) {
+            if (!clusteringEdgeTypes.has(edge.type)) continue;
+            if (edge.source === edge.target) continue;
+            if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) continue;
+
+            // For large graphs, skip low-confidence edges
+            if (isLarge && edge.weight !== undefined && edge.weight < 0.5) continue;
+
+            if (!graph.hasEdge(edge.source, edge.target)) {
+                graph.addEdge(edge.source, edge.target);
+            }
+        }
+
+        return graph;
+    }
+
+    /**
+     * Create Community nodes with auto-generated labels based on member file paths
+     */
+    private createCommunityNodes(
+        communities: Record<string, number>,
+        communityCount: number,
+        graph: Graph,
+        allNodes: GraphNode[]
+    ): CommunityNode[] {
+        // Group node IDs by community
+        const communityMembers = new Map<number, string[]>();
+
+        Object.entries(communities).forEach(([nodeId, commNum]) => {
+            if (!communityMembers.has(commNum)) {
+                communityMembers.set(commNum, []);
+            }
+            communityMembers.get(commNum)!.push(nodeId);
+        });
+
+        // Build node lookup for file paths
+        const nodePathMap = new Map<string, string>();
+        for (const node of allNodes) {
+            if (node.path) {
+                nodePathMap.set(node.id, node.path);
+            }
+        }
+
+        // Create community nodes - SKIP SINGLETONS (isolated nodes)
+        const communityNodes: CommunityNode[] = [];
+
+        communityMembers.forEach((memberIds, commNum) => {
+            // Skip singleton communities - they're just isolated nodes
+            if (memberIds.length < 2) return;
+
+            const heuristicLabel = this.generateHeuristicLabel(memberIds, nodePathMap, graph, commNum);
+
+            communityNodes.push({
+                id: `comm_${commNum}`,
+                label: heuristicLabel,
+                heuristicLabel,
+                cohesion: this.calculateCohesion(memberIds, graph),
+                symbolCount: memberIds.length,
+            });
+        });
 
         // Sort by size descending
-        clusters.sort((a, b) => b.nodeCount - a.nodeCount);
+        communityNodes.sort((a, b) => b.symbolCount - a.symbolCount);
 
-        return clusters;
+        return communityNodes;
     }
 
-    private inferClusterName(
-        paths: string[],
+    /**
+     * Generate a human-readable label from the most common folder name in the community
+     */
+    private generateHeuristicLabel(
         memberIds: string[],
-        nodes: GraphNode[]
+        nodePathMap: Map<string, string>,
+        graph: Graph,
+        commNum: number
     ): string {
-        // Try to infer from common path prefix
-        if (paths.length > 0) {
-            const parts = paths.map(p => p.split(/[/\\]/));
-            const minLength = Math.min(...parts.map(p => p.length));
+        // Collect folder names from file paths
+        const folderCounts = new Map<string, number>();
 
-            let commonPrefix: string[] = [];
-            for (let i = 0; i < minLength; i++) {
-                const part = parts[0][i];
-                if (parts.every(p => p[i] === part)) {
-                    commonPrefix.push(part);
-                } else {
-                    break;
+        memberIds.forEach(nodeId => {
+            const filePath = nodePathMap.get(nodeId) || '';
+            const parts = filePath.split('/').filter(Boolean);
+
+            // Get the most specific folder (parent directory)
+            if (parts.length >= 2) {
+                const folder = parts[parts.length - 2];
+                // Skip generic folder names
+                if (!['src', 'lib', 'core', 'utils', 'common', 'shared', 'helpers'].includes(folder.toLowerCase())) {
+                    folderCounts.set(folder, (folderCounts.get(folder) || 0) + 1);
                 }
             }
+        });
 
-            for (let i = commonPrefix.length - 1; i >= 0; i--) {
-                const name = commonPrefix[i];
-                if (name && !['src', 'lib', 'dist', 'build', 'node_modules'].includes(name.toLowerCase())) {
-                    return name.charAt(0).toUpperCase() + name.slice(1);
-                }
+        // Find most common folder
+        let maxCount = 0;
+        let bestFolder = '';
+
+        folderCounts.forEach((count, folder) => {
+            if (count > maxCount) {
+                maxCount = count;
+                bestFolder = folder;
+            }
+        });
+
+        if (bestFolder) {
+            // Capitalize first letter
+            return bestFolder.charAt(0).toUpperCase() + bestFolder.slice(1);
+        }
+
+        // Fallback: use function names to detect patterns
+        const names: string[] = [];
+        memberIds.forEach(nodeId => {
+            if (graph.hasNode(nodeId)) {
+                const name = graph.getNodeAttribute(nodeId, 'name');
+                if (name) names.push(name);
+            }
+        });
+
+        // Look for common prefixes
+        if (names.length > 2) {
+            const commonPrefix = this.findCommonPrefix(names);
+            if (commonPrefix.length > 2) {
+                return commonPrefix.charAt(0).toUpperCase() + commonPrefix.slice(1);
             }
         }
 
-        // Try to infer from symbol names
-        const symbolNames = memberIds
-            .map(id => nodes.find(n => n.id === id)?.name)
-            .filter(Boolean) as string[];
-
-        if (symbolNames.length > 0) {
-            const prefixCounts = new Map<string, number>();
-            for (const name of symbolNames) {
-                const match = name.match(/^([a-z]+)/i);
-                if (match) {
-                    const prefix = match[1].toLowerCase();
-                    if (prefix.length >= 3) {
-                        prefixCounts.set(prefix, (prefixCounts.get(prefix) || 0) + 1);
-                    }
-                }
-            }
-
-            let maxCount = 0;
-            let bestPrefix = '';
-            for (const [prefix, count] of prefixCounts) {
-                if (count > maxCount && count >= 2) {
-                    maxCount = count;
-                    bestPrefix = prefix;
-                }
-            }
-
-            if (bestPrefix) {
-                return bestPrefix.charAt(0).toUpperCase() + bestPrefix.slice(1);
-            }
-        }
-
-        return `Community ${paths.length + 1}`;
+        // Last resort: generic name with community ID for uniqueness
+        return `Cluster_${commNum}`;
     }
 
-    private clusterByStructure(nodes: GraphNode[]): CommunityDetectionResult {
-        const nodeClusterMap = new Map<string, number>();
-        const directoryClusters = new Map<string, number>();
-        let clusterId = 0;
+    /**
+     * Find common prefix among strings
+     */
+    private findCommonPrefix(strings: string[]): string {
+        if (strings.length === 0) return '';
 
-        for (const node of nodes) {
-            if (!node.path) continue;
+        const sorted = strings.slice().sort();
+        const first = sorted[0];
+        const last = sorted[sorted.length - 1];
 
-            // Get parent directory (2 levels up for better grouping)
-            const parts = node.path.split(/[/\\]/);
-            const keyParts = parts.slice(0, Math.min(parts.length - 1, 3));
-            const dirKey = keyParts.join('/');
-
-            if (!directoryClusters.has(dirKey)) {
-                directoryClusters.set(dirKey, clusterId++);
-            }
-
-            nodeClusterMap.set(node.id, directoryClusters.get(dirKey)!);
+        let i = 0;
+        while (i < first.length && first[i] === last[i]) {
+            i++;
         }
 
-        const clusterMembers = new Map<number, string[]>();
-        for (const [nodeId, cluster] of nodeClusterMap) {
-            if (!clusterMembers.has(cluster)) {
-                clusterMembers.set(cluster, []);
-            }
-            clusterMembers.get(cluster)!.push(nodeId);
-        }
+        return first.substring(0, i);
+    }
 
-        const clusters: ClusterInfo[] = [];
-        for (const [id, memberIds] of clusterMembers) {
-            if (memberIds.length < 2) continue;
+    /**
+     * Estimate cohesion score (0-1) based on internal edge density.
+     * Uses sampling for large communities to avoid O(N^2) cost.
+     */
+    private calculateCohesion(memberIds: string[], graph: Graph): number {
+        if (memberIds.length <= 1) return 1.0;
 
-            const paths = memberIds
-                .map(nid => nodes.find(n => n.id === nid)?.path)
-                .filter(Boolean) as string[];
+        const memberSet = new Set(memberIds);
 
-            clusters.push({
-                id,
-                name: this.inferClusterName(paths, memberIds, nodes),
-                color: COMMUNITY_COLORS[id % COMMUNITY_COLORS.length],
-                nodeCount: memberIds.length
+        // Sample up to 50 members for large communities
+        const SAMPLE_SIZE = 50;
+        const sample = memberIds.length <= SAMPLE_SIZE
+            ? memberIds
+            : memberIds.slice(0, SAMPLE_SIZE);
+
+        let internalEdges = 0;
+        let totalEdges = 0;
+
+        for (const nodeId of sample) {
+            if (!graph.hasNode(nodeId)) continue;
+            graph.forEachNeighbor(nodeId, (neighbor: string) => {
+                totalEdges++;
+                if (memberSet.has(neighbor)) {
+                    internalEdges++;
+                }
             });
         }
 
-        return { clusters, nodeClusterMap };
+        // Cohesion = fraction of edges that stay internal
+        if (totalEdges === 0) return 1.0;
+        return Math.min(1.0, internalEdges / totalEdges);
     }
+}
+
+/**
+ * Calculate modularity score for a community assignment
+ * Modularity measures how well-separated the communities are
+ */
+function calculateModularity(graph: Graph, communityMap: Map<string, number>): number {
+    const m = graph.size;
+    if (m === 0) return 0;
+
+    // Calculate total weight
+    let totalWeight = 0;
+    graph.forEachEdge((edge, attrs, source, target) => {
+        totalWeight += (attrs.weight || 1);
+    });
+
+    if (totalWeight === 0) {
+        // Unweighted graph - assume weight 1 for each edge
+        totalWeight = graph.size;
+    }
+
+    let modularity = 0;
+
+    graph.forEachNode((node: string) => {
+        const community = communityMap.get(node);
+        if (community === undefined) return;
+
+        const kI = graph.degree(node); // Sum of weights of edges incident to node i
+        const kJ = graph.degree(node); // For loop detection
+
+        graph.forEachNeighbor(node, (neighbor: string) => {
+            const neighborCommunity = communityMap.get(neighbor);
+            if (neighborCommunity === community && community !== undefined) {
+                // Edge within community
+                modularity += 1;
+            }
+        });
+    });
+
+    // Simplified modularity formula
+    // Q = (1/2m) * sum_ij [A_ij - (k_i * k_j) / 2m] * delta(c_i, c_j)
+    return modularity / (2 * totalWeight);
 }

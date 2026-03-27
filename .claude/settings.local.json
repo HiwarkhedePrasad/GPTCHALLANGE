@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(npm run:*)",
-      "Bash(claude:*)"
+      "Bash(claude:*)",
+      "Bash(npm install:*)",
+      "Bash(mkdir -p \"C:/Users phiwa/Desktop/gptchallenge/extension/src/core/embeddings\")",
+      "Read(//c/Users phiwa/Desktop/gptchallenge/extension/**)",
+      "Bash(npm search:*)"
     ]
   }
 }

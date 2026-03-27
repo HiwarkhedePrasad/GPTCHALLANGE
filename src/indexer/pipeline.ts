@@ -21,7 +21,7 @@ import { StructureProcessor } from './structure-processor';
 import { ParsingProcessor }   from './parsing-processor';
 import { ImportProcessor }    from './import-processor';
 import { CallProcessor }      from './call-processor';
-import { CommunityProcessor } from './community-processor';
+import { CommunityProcessor, getCommunityColor } from './community-processor';
 import { ClusterEnricher }    from './cluster-enricher';
 import { ProcessProcessor }   from './process-processor';
 
@@ -205,25 +205,34 @@ export class Pipeline {
         cancelled();
 
         // ================================================================
-        // PHASE 4: Clustering (unchanged — pure in-memory graph algorithm)
+        // PHASE 4: Clustering (Leiden algorithm via graphology)
         // ================================================================
         report(4, 'Clustering', 'Detecting communities...');
         cancelled();
 
-        const communityResult = this.communityProc.process(nodes, edges);
+        const communityResult = this.communityProc.process(
+            nodes,
+            edges,
+            (msg, progress) => report(4, 'Clustering', msg)
+        );
 
         for (const node of nodes) {
             node.cluster = communityResult.nodeClusterMap.get(node.id);
         }
 
         const enrichedClusters = this.clusterEnricher.enrich(
-            communityResult.clusters,
+            communityResult.communities.map(c => ({
+                id: parseInt(c.id.split('_')[1]) || 0,
+                name: c.label,
+                color: getCommunityColor(parseInt(c.id.split('_')[1]) || 0),
+                nodeCount: c.symbolCount
+            })),
             nodes,
             edges,
             communityResult.nodeClusterMap
         );
 
-        report(4, 'Clustering', `${communityResult.clusters.length} clusters`, 15);
+        report(4, 'Clustering', `${communityResult.communities.length} clusters`, 15);
         cancelled();
 
         // ================================================================

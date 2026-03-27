@@ -1,99 +1,125 @@
 /**
- * Phase 2: Tree-sitter Queries
- * Provides tree-sitter based AST queries for more accurate symbol extraction
- * Note: Tree-sitter parsing is more accurate than regex but requires language parsers
- * This file provides query definitions and utilities for when tree-sitter is available
+ * Tree-sitter Queries
+ *
+ * Provides tree-sitter based AST queries for accurate symbol extraction.
+ * Uses actual tree-sitter parsers when available.
  */
 
-export interface TSQuery {
-    language: string;
-    captures: Map<string, unknown[]>;
-}
+import { TreeSitterParser, TSParsedSymbol, getTreeSitterParser } from './tree-sitter-parser';
+import { FileCache } from './FileCache';
 
-export interface SymbolQuery {
-    name: string;
-    type: 'function' | 'class' | 'interface' | 'method' | 'variable' | 'type';
-    nodeType: string;
-    field?: string;
-}
+export { TSParsedSymbol };
 
-// Query definitions for different language ASTs
-export const LANGUAGE_QUERIES: Record<string, SymbolQuery[]> = {
-    typescript: [
-        // Function declarations
-        { name: 'identifier', type: 'function', nodeType: 'function_declaration' },
-        { name: 'identifier', type: 'function', nodeType: 'function_signature' },
-        // Method definitions in classes
-        { name: 'property_identifier', type: 'method', nodeType: 'method_definition' },
-        { name: 'property_identifier', type: 'method', nodeType: 'method_signature' },
-        // Class declarations
-        { name: 'identifier', type: 'class', nodeType: 'class_declaration' },
-        { name: 'identifier', type: 'class', nodeType: 'class_heritage' },
-        // Interface declarations
-        { name: 'identifier', type: 'interface', nodeType: 'interface_declaration' },
-        { name: 'type_identifier', type: 'type', nodeType: 'type_alias_declaration' },
-        // Variable declarations
-        { name: 'identifier', type: 'variable', nodeType: 'variable_declarator' },
-    ],
-    javascript: [
-        { name: 'identifier', type: 'function', nodeType: 'function_declaration' },
-        { name: 'property_identifier', type: 'method', nodeType: 'method_definition' },
-        { name: 'identifier', type: 'class', nodeType: 'class_declaration' },
-        { name: 'identifier', type: 'variable', nodeType: 'variable_declarator' },
-    ],
-    python: [
-        { name: 'identifier', type: 'function', nodeType: 'function_definition' },
-        { name: 'identifier', type: 'class', nodeType: 'class_definition' },
-        { name: 'identifier', type: 'method', nodeType: 'method_definition' },
-        { name: 'identifier', type: 'variable', nodeType: 'assignment' },
-    ],
-    rust: [
-        { name: 'identifier', type: 'function', nodeType: 'function_item' },
-        { name: 'identifier', type: 'class', nodeType: 'struct_item' },
-        { name: 'identifier', type: 'class', nodeType: 'enum_item' },
-        { name: 'identifier', type: 'interface', nodeType: 'trait_item' },
-        { name: 'type_identifier', type: 'type', nodeType: 'type_alias_item' },
-        { name: 'identifier', type: 'variable', nodeType: 'let_declaration' },
-    ],
-    go: [
-        { name: 'identifier', type: 'function', nodeType: 'function_declaration' },
-        { name: 'field_identifier', type: 'method', nodeType: 'method_declaration' },
-        { name: 'type_identifier', type: 'class', nodeType: 'type_declaration' },
-        { name: 'type_identifier', type: 'interface', nodeType: 'interface_type' },
-    ],
-    java: [
-        { name: 'identifier', type: 'function', nodeType: 'method_declaration' },
-        { name: 'identifier', type: 'class', nodeType: 'class_declaration' },
-        { name: 'identifier', type: 'interface', nodeType: 'interface_declaration' },
-        { name: 'identifier', type: 'type', nodeType: 'type_declaration' },
-    ]
+// Language-specific query definitions for tree-sitter
+export const LANGUAGE_QUERIES: Record<string, {
+    function: string[];
+    class: string[];
+    method: string[];
+    interface: string[];
+    variable: string[];
+    type: string[];
+}> = {
+    typescript: {
+        function: ['function_declaration', 'function_signature', 'arrow_function'],
+        class: ['class_declaration', 'class_heritage'],
+        method: ['method_definition', 'method_signature'],
+        interface: ['interface_declaration'],
+        variable: ['variable_declarator'],
+        type: ['type_alias_declaration', 'enum_declaration']
+    },
+    javascript: {
+        function: ['function_declaration', 'arrow_function'],
+        class: ['class_declaration'],
+        method: ['method_definition'],
+        interface: [],
+        variable: ['variable_declarator'],
+        type: []
+    },
+    python: {
+        function: ['function_definition'],
+        class: ['class_definition'],
+        method: ['method_definition'],
+        interface: [],
+        variable: ['assignment'],
+        type: ['type_alias']
+    },
+    rust: {
+        function: ['function_item'],
+        class: ['struct_item', 'enum_item'],
+        method: ['method_definition'],
+        interface: ['trait_item'],
+        variable: ['let_declaration'],
+        type: ['type_alias_item']
+    },
+    go: {
+        function: ['function_declaration'],
+        class: ['type_declaration'],
+        method: ['method_declaration'],
+        interface: ['interface_type'],
+        variable: [],
+        type: ['type_alias']
+    },
+    java: {
+        function: ['method_declaration'],
+        class: ['class_declaration'],
+        method: ['method_declaration'],
+        interface: ['interface_declaration'],
+        variable: ['variable_declarator'],
+        type: ['type_declaration']
+    }
 };
 
 export class TreeSitterQueries {
-    /**
-     * Get queries for a specific language
-     */
-    getQueries(language: string): SymbolQuery[] {
-        return LANGUAGE_QUERIES[language.toLowerCase()] || [];
+    private parser: TreeSitterParser;
+    private available: boolean;
+
+    constructor() {
+        this.parser = getTreeSitterParser();
+        this.available = this.parser.isAvailable();
     }
 
     /**
      * Check if tree-sitter is available and initialized
      */
     isAvailable(): boolean {
-        // Tree-sitter requires native bindings that may not be available
-        // This is a placeholder for when tree-sitter is integrated
-        return false;
+        return this.available;
     }
 
     /**
-     * Parse content using tree-sitter (when available)
+     * Get queries for a specific language
+     */
+    getQueries(language: string): typeof LANGUAGE_QUERIES['typescript'] {
+        return LANGUAGE_QUERIES[language.toLowerCase()] || LANGUAGE_QUERIES['typescript'];
+    }
+
+    /**
+     * Parse content using tree-sitter
      * Returns captured nodes matching the queries
      */
-    async parse(content: string, language: string): Promise<TSQuery | null> {
-        // Placeholder - tree-sitter integration would go here
-        // For now, return null to fall back to regex parsing
-        return null;
+    async parse(
+        content: string,
+        ext: string,
+        filePath?: string
+    ): Promise<TSParsedSymbol[]> {
+        if (!this.available) {
+            return [];
+        }
+
+        return this.parser.parseFile(content, ext);
+    }
+
+    /**
+     * Parse multiple files using tree-sitter
+     */
+    async parseFiles(
+        cache: FileCache,
+        onProgress?: (message: string, current: number, total: number) => void
+    ): Promise<Map<string, TSParsedSymbol[]>> {
+        if (!this.available) {
+            return new Map();
+        }
+
+        return this.parser.parseFiles(cache, onProgress);
     }
 
     /**
@@ -104,8 +130,10 @@ export class TreeSitterQueries {
         const queries = this.getQueries(language);
         const queryParts: string[] = [];
 
-        for (const query of queries) {
-            queryParts.push(`(${query.nodeType} (${query.name}) @${query.type})`);
+        for (const [type, nodeTypes] of Object.entries(queries)) {
+            for (const nodeType of nodeTypes) {
+                queryParts.push(`(${nodeType}) @${type}`);
+            }
         }
 
         return queryParts.join('\n');

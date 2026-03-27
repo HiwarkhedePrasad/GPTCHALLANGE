@@ -196,17 +196,12 @@ class AnthropicProvider implements LLMProvider {
     }
 
     private formatMessage(msg: LLMMessage): Record<string, unknown> {
-        if (msg.role === 'assistant' && msg.tool_calls) {
-            return {
-                role: 'assistant',
-                content: msg.tool_calls.map(tc => ({
-                    type: 'tool_use',
-                    id: tc.id,
-                    name: tc.function.name,
-                    input: JSON.parse(tc.function.arguments),
-                })),
-            };
-        }
+        if (msg.role === 'assistant') {
+    return {
+        role: 'assistant',
+        content: msg.content || '',
+    };
+}
 
         if (msg.role === 'tool') {
             return {

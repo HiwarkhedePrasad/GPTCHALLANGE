@@ -4,10 +4,13 @@
  *
  * CHANGE: Accepts a FileCache instead of reading from disk.
  * All file I/O is now done once in the pipeline (FileCache.load) — this
- * processor only does CPU work (regex matching) from that in-memory store.
+ * processor only does CPU work (regex matching or tree-sitter parsing) from that in-memory store.
+ *
+ * Uses tree-sitter for AST-based parsing when available, falls back to regex.
  */
 
 import { FileCache } from './FileCache';
+import { TreeSitterParser } from './tree-sitter-parser';
 
 export interface ParsedSymbol {
     name: string;
@@ -17,11 +20,24 @@ export interface ParsedSymbol {
 }
 
 export class ParsingProcessor {
+    private treeSitterParser: TreeSitterParser | null = null;
+
+    constructor() {
+        // Initialize tree-sitter parser if available
+        try {
+            this.treeSitterParser = new TreeSitterParser();
+        } catch {
+            console.log('[Parsing] Tree-sitter not available, using regex parsing');
+        }
+    }
+
     /**
      * Parse all files in the cache.
      *
      * No disk I/O here — works entirely from RAM.
      * Batching + setImmediate keeps VS Code responsive.
+     *
+     * Uses tree-sitter for AST parsing when available, falls back to regex.
      */
     async parseFiles(
         cache: FileCache,
@@ -33,6 +49,33 @@ export class ParsingProcessor {
         const BATCH = 100;                             // larger batch is fine — no I/O cost
         let processed = 0;
 
+        // Try tree-sitter first
+        const useTreeSitter = this.treeSitterParser?.isAvailable() ?? false;
+
+        if (useTreeSitter) {
+            // Tree-sitter based parsing
+            try {
+                const tsResults = await this.treeSitterParser!.parseFiles(
+                    cache,
+                    (msg, cur, tot) => onProgress?.(msg, cur, tot)
+                );
+
+                // Convert tree-sitter symbols to ParsedSymbol format
+                for (const [absPath, symbols] of tsResults.entries()) {
+                    symbolsByFile.set(absPath, symbols.map(s => ({
+                        name: s.name,
+                        type: s.type,
+                        location: s.location,
+                        metadata: s.metadata
+                    })));
+                }
+                return symbolsByFile;
+            } catch (error) {
+                console.warn('[Parsing] Tree-sitter failed, falling back to regex:', error);
+            }
+        }
+
+        // Fallback to regex parsing
         for (let i = 0; i < entries.length; i += BATCH) {
             const batch = entries.slice(i, i + BATCH);
 
